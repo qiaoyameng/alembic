@@ -165,6 +165,27 @@ def _render_modify_table(
         return []
 
 
+@renderers.dispatch_for(ops.AutocommitOp)
+def _render_autocommit_op(
+    autogen_context: AutogenContext, op: ops.AutocommitOp
+) -> list[str]:
+    if autogen_context._has_batch:
+        raise util.CommandError(
+            "AutocommitOp groups cannot be rendered within a "
+            "batch_alter_table() block."
+        )
+    op._validate_ops()
+
+    prefix = autogen_context.opts["alembic_module_prefix"] or ""
+    lines = [f"with {prefix}get_context().autocommit_block():"]
+    for sub_op in op.ops:
+        lines.extend(render_op(autogen_context, sub_op))
+    if not op.ops:
+        lines.append("pass")
+    lines.append("")
+    return lines
+
+
 @renderers.dispatch_for(ops.CreateTableCommentOp)
 def _render_create_table_comment(
     autogen_context: AutogenContext, op: ops.CreateTableCommentOp

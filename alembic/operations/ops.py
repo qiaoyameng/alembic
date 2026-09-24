@@ -2712,6 +2712,84 @@ class ModifyTableOps(OpContainer):
         )
 
 
+class AutocommitOp(OpContainer):
+    """Represent a group of operations that must be invoked within an
+    "autocommit" block.
+
+    This object allows a series of otherwise ordinary migration operations
+    to be grouped together such that they are rendered and executed inside
+    a :meth:`.MigrationContext.autocommit_block`.  It is primarily intended
+    for use by extensions such as ``process_revision_directives`` hooks and
+    :class:`.Rewriter` objects, which may wrap a portion of the autogenerate
+    operation stream so that the generated revision script emits the group
+    inside an autocommit block::
+
+        def upgrade():
+            with op.get_context().autocommit_block():
+                op.execute("ALTER TYPE mood ADD VALUE 'soso'")
+
+    The group may also be invoked directly through the standard
+    :class:`.Operations` dispatch, e.g.::
+
+        op.invoke(ops.AutocommitOp([ops.ExecuteSQLOp("VACUUM ANALYZE")]))
+
+    .. warning::
+
+        Entering an autocommit block **unconditionally commits** the
+        database transaction that precedes the block.  If any operation
+        within the group fails, operations that were already committed -
+        including those preceding the group within the same migration -
+        **cannot be rolled back**.  See the warning in
+        :meth:`.MigrationContext.autocommit_block` for additional
+        background.
+
+    .. note::
+
+        :class:`.AutocommitOp` groups may not be nested inside one another,
+        and may not contain or be contained by batch
+        (``op.batch_alter_table()``) operations.  These structures are
+        rejected consistently when the group is constructed, rendered, or
+        executed.
+
+    .. versionadded:: 1.18
+
+    """
+
+    def __init__(self, ops: Sequence[MigrateOperation] = ()) -> None:
+        super().__init__(ops)
+        self._validate_ops()
+
+    def _validate_ops(self) -> None:
+        for op in self.ops:
+            if isinstance(op, AutocommitOp):
+                raise util.CommandError(
+                    "AutocommitOp groups cannot be nested inside other "
+                    "AutocommitOp groups."
+                )
+            elif isinstance(op, ModifyTableOps):
+                raise util.CommandError(
+                    "AutocommitOp groups cannot contain ModifyTableOps "
+                    "structures, as these may be rendered or executed as "
+                    "batch_alter_table() blocks, which are not supported "
+                    "inside an autocommit block."
+                )
+
+    def reverse(self) -> AutocommitOp:
+        reversed_ops: list[MigrateOperation] = []
+        for op in reversed(self.ops):
+            try:
+                reversed_ops.append(op.reverse())
+            except NotImplementedError as err:
+                raise util.CommandError(
+                    f"Cannot produce a downgrade for this AutocommitOp "
+                    f"group: the operation {op!r} does not define a "
+                    f"reverse() operation.  A downgrade consisting of an "
+                    f"empty or partial autocommit block will not be "
+                    f"generated."
+                ) from err
+        return AutocommitOp(reversed_ops)
+
+
 class UpgradeOps(OpContainer):
     """contains a sequence of operations that would apply to the
     'upgrade' stream of a script.

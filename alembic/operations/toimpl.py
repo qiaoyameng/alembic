@@ -6,11 +6,28 @@ from typing import TYPE_CHECKING
 from sqlalchemy import schema as sa_schema
 
 from . import ops
+from .base import BatchOperations
 from .base import Operations
+from .. import util
 from ..util.sqla_compat import _copy
 
 if TYPE_CHECKING:
     from sqlalchemy.sql.schema import Table
+
+
+@Operations.implementation_for(ops.AutocommitOp)
+def autocommit_block(
+    operations: "Operations", operation: "ops.AutocommitOp"
+) -> None:
+    if isinstance(operations, BatchOperations):
+        raise util.CommandError(
+            "AutocommitOp groups cannot be invoked within a "
+            "batch_alter_table() block."
+        )
+    operation._validate_ops()
+    with operations.migration_context.autocommit_block():
+        for sub_operation in operation.ops:
+            operations.invoke(sub_operation)
 
 
 @Operations.implementation_for(ops.AlterColumnOp)

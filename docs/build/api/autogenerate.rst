@@ -403,6 +403,65 @@ multiple times when running autogenerate:
   when referring to the collection of :class:`.UpgradeOps` and
   :class:`.DowngradeOps` objects.
 
+.. _autogen_autocommit_ops:
+
+Grouping Operations into Autocommit Blocks
+------------------------------------------
+
+.. versionadded:: 1.18
+
+Some database operations, most notably certain PostgreSQL DDL such as
+``ALTER TYPE ... ADD VALUE``, must be run outside of a transaction block.
+At runtime this is handled by
+:meth:`.MigrationContext.autocommit_block`.  Within the autogenerate
+operation stream, the :class:`.AutocommitOp` object allows a group of
+otherwise ordinary migration operations to be marked as requiring an
+autocommit block, so that extensions such as a
+:paramref:`.EnvironmentContext.configure.process_revision_directives`
+hook or a :class:`.Rewriter` can wrap part of the operation stream and
+have the generated revision script emit the group accordingly::
+
+    from alembic.operations import ops
+
+    def process_revision_directives(context, revision, directives):
+        script = directives[0]
+        script.upgrade_ops.ops[:] = [
+            ops.AutocommitOp(script.upgrade_ops.ops)
+        ]
+
+The structure above renders into the revision script as a runtime
+autocommit block surrounding the individual operations, preserving
+their order::
+
+    def upgrade():
+        with op.get_context().autocommit_block():
+            op.execute("ALTER TYPE mood ADD VALUE 'soso'")
+            op.create_index('ix_t1_id', 't1', ['id'], unique=False)
+
+:class:`.AutocommitOp` groups may appear anywhere within the
+:class:`.UpgradeOps` / :class:`.DowngradeOps` operation trees, including
+the per-engine operation collections used by the multiple database
+``multidb`` template.  A group may also be invoked directly through the
+standard :class:`.Operations` dispatch, e.g.
+``op.invoke(ops.AutocommitOp([...]))``.  When a group is reversed, the
+contained operations are reversed in reverse order; if any contained
+operation does not define a reverse operation, an error is raised rather
+than producing an empty or partial downgrade block.
+
+:class:`.AutocommitOp` groups may **not** be nested within each other,
+and may **not** contain or be contained by ``op.batch_alter_table()``
+batch operations; these structures are rejected when the group is
+constructed, rendered, or executed.
+
+.. warning::
+
+    Entering an autocommit block **unconditionally commits** the database
+    transaction that precedes the block.  If an operation within the
+    group fails, operations that were already committed - including those
+    preceding the group within the same migration - **cannot be rolled
+    back**.  See the warning in
+    :meth:`.MigrationContext.autocommit_block` for additional background.
+
 .. _autogen_custom_ops:
 
 Autogenerating Custom Operation Directives

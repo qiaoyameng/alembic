@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from .ops import AddConstraintOp
     from .ops import AlterColumnOp
     from .ops import AlterTableOp
+    from .ops import AutocommitOp
     from .ops import BulkInsertOp
     from .ops import CreateIndexOp
     from .ops import CreateTableCommentOp
@@ -420,6 +421,7 @@ class AbstractOperations(util.ModuleClsProxy):
         operation: (
             AddConstraintOp
             | DropConstraintOp
+            | AutocommitOp
             | CreateIndexOp
             | DropIndexOp
             | AddColumnOp
