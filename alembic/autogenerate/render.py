@@ -165,6 +165,36 @@ def _render_modify_table(
         return []
 
 
+@renderers.dispatch_for(ops.AutocommitOp)
+def _render_autocommit_op(
+    autogen_context: AutogenContext, op: ops.AutocommitOp
+) -> list[str]:
+    if autogen_context._has_batch:
+        raise util.CommandError(
+            "AutocommitOp cannot be rendered inside of a "
+            "batch_alter_table block"
+        )
+    op.validate()
+
+    if not op.ops:
+        return []
+
+    render_as_batch = autogen_context.opts.get("render_as_batch", False)
+
+    lines = ["with op.autocommit_block():"]
+    for t_op in op.ops:
+        if render_as_batch and isinstance(t_op, ops.ModifyTableOps):
+            raise util.CommandError(
+                "AutocommitOp cannot contain operations that render "
+                "as a batch_alter_table block"
+            )
+        t_lines = render_op(autogen_context, t_op)
+        lines.extend(t_lines)
+    lines.append("")
+
+    return lines
+
+
 @renderers.dispatch_for(ops.CreateTableCommentOp)
 def _render_create_table_comment(
     autogen_context: AutogenContext, op: ops.CreateTableCommentOp

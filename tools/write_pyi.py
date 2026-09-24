@@ -446,7 +446,7 @@ cases = [
         location / "op.pyi",
         Operations,
         ignore_items={"context", "create_module_class_proxy"},
-        context_managers={"batch_alter_table"},
+        context_managers={"autocommit_block", "batch_alter_table"},
     ),
     StubFileInfo(
         "context",

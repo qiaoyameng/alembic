@@ -1687,6 +1687,43 @@ class Operations(AbstractOperations):
 
         # END STUB FUNCTIONS: op_cls
 
+    @contextmanager
+    def autocommit_block(self) -> Iterator[None]:
+        """Enter an "autocommit" block, for databases that support
+        AUTOCOMMIT isolation levels.
+
+        This is a proxy for
+        :meth:`.MigrationContext.autocommit_block`; see that method
+        for complete background.  Within a migration script, the
+        block may be used as::
+
+            def upgrade():
+                with op.autocommit_block():
+                    op.execute("ALTER TYPE mood ADD VALUE 'soso'")
+
+        .. warning::
+
+            As is necessary, **the database transaction preceding the
+            block is unconditionally committed**.  If any operation
+            within the block fails, statements that were already
+            committed, whether before the block was entered or within
+            the block itself, are **not** rolled back.
+
+        Autocommit blocks may not be nested, and may not be used inside
+        of a :meth:`.Operations.batch_alter_table` block.
+
+        .. versionadded:: 1.21.0
+
+        .. seealso::
+
+            :meth:`.MigrationContext.autocommit_block`
+
+            :class:`.AutocommitOp`
+
+        """
+        with self.migration_context.autocommit_block():
+            yield
+
 
 class BatchOperations(AbstractOperations):
     """Modifies the interface :class:`.Operations` for batch mode.

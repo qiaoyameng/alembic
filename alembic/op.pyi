@@ -297,9 +297,44 @@ def alter_column(
      :class:`~sqlalchemy.sql.elements.quoted_name`.
     :param postgresql_using: String argument which will indicate a
      SQL expression to render within the Postgresql-specific USING clause
-     within ALTER COLUMN.    This string is taken directly as raw SQL which
-     must explicitly include any necessary quoting or escaping of tokens
-     within the expression.
+    within ALTER COLUMN.    This string is taken directly as raw SQL which
+    must explicitly include any necessary quoting or escaping of tokens
+    within the expression.
+
+    """
+
+@contextmanager
+def autocommit_block() -> Iterator[None]:
+    """Enter an "autocommit" block, for databases that support
+    AUTOCOMMIT isolation levels.
+
+    This is a proxy for
+    :meth:`.MigrationContext.autocommit_block`; see that method
+    for complete background.  Within a migration script, the
+    block may be used as::
+
+        def upgrade():
+            with op.autocommit_block():
+                op.execute("ALTER TYPE mood ADD VALUE 'soso'")
+
+    .. warning::
+
+        As is necessary, **the database transaction preceding the
+        block is unconditionally committed**.  If any operation
+        within the block fails, statements that were already
+        committed, whether before the block was entered or within
+        the block itself, are **not** rolled back.
+
+    Autocommit blocks may not be nested, and may not be used inside
+    of a :meth:`.Operations.batch_alter_table` block.
+
+    .. versionadded:: 1.21.0
+
+    .. seealso::
+
+        :meth:`.MigrationContext.autocommit_block`
+
+        :class:`.AutocommitOp`
 
     """
 

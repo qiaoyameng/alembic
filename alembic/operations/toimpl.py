@@ -6,7 +6,9 @@ from typing import TYPE_CHECKING
 from sqlalchemy import schema as sa_schema
 
 from . import ops
+from .base import BatchOperations
 from .base import Operations
+from .. import util
 from ..util.sqla_compat import _copy
 
 if TYPE_CHECKING:
@@ -256,3 +258,18 @@ def execute_sql(
     operations.migration_context.impl.execute(
         operation.sqltext, execution_options=operation.execution_options
     )
+
+
+@Operations.implementation_for(ops.AutocommitOp)
+def autocommit_op(
+    operations: "Operations", operation: "ops.AutocommitOp"
+) -> None:
+    if isinstance(operations, BatchOperations):
+        raise util.CommandError(
+            "AutocommitOp cannot be invoked inside of a "
+            "batch_alter_table block"
+        )
+    operation.validate()
+    with operations.migration_context.autocommit_block():
+        for sub_op in operation.ops:
+            operations.invoke(sub_op)
