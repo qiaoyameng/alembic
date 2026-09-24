@@ -15,8 +15,11 @@ from sqlalchemy import PrimaryKeyConstraint
 from sqlalchemy import schema as sql_schema
 from sqlalchemy import select
 from sqlalchemy import Table
+from sqlalchemy import text
 from sqlalchemy import types as sqltypes
+from sqlalchemy.sql.elements import ColumnClause
 from sqlalchemy.sql.schema import SchemaEventTarget
+from sqlalchemy.sql.visitors import replacement_traverse
 from sqlalchemy.util import OrderedDict
 from sqlalchemy.util import topological
 
@@ -42,7 +45,7 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from sqlalchemy.engine import Dialect
-    from sqlalchemy.sql.elements import ColumnClause
+    from sqlalchemy.sql.elements import ColumnElement
     from sqlalchemy.sql.elements import quoted_name
     from sqlalchemy.sql.schema import Constraint
     from sqlalchemy.sql.type_api import TypeEngine
@@ -65,6 +68,7 @@ class BatchOperationsImpl:
         reflect_kwargs,
         naming_convention,
         partial_reordering,
+        column_migration_expressions=None,
     ):
         self.operations = operations
         self.table_name = table_name
@@ -87,6 +91,7 @@ class BatchOperationsImpl:
         )
         self.naming_convention = naming_convention
         self.partial_reordering = partial_reordering
+        self.column_migration_expressions = column_migration_expressions
         self.batch = []
 
     @property
@@ -107,6 +112,15 @@ class BatchOperationsImpl:
 
     def flush(self) -> None:
         should_recreate = self._should_recreate()
+
+        if self.column_migration_expressions and not should_recreate:
+            raise exc.CommandError(
+                "The column_migration_expressions argument requires "
+                "that the table is recreated using 'move and copy'; "
+                "the current batch of operations does not require "
+                "recreation.  Pass recreate='always' to "
+                "batch_alter_table() to force the recreate."
+            )
 
         with _ensure_scope_for_ddl(self.impl.connection):
             if not should_recreate:
@@ -165,6 +179,9 @@ class BatchOperationsImpl:
                     self.table_kwargs,
                     reflected,
                     partial_reordering=self.partial_reordering,
+                    column_migration_expressions=(
+                        self.column_migration_expressions
+                    ),
                 )
                 for opname, arg, kw in self.batch:
                     fn = getattr(batch_impl, opname)
@@ -228,6 +245,9 @@ class ApplyBatchImpl:
         table_kwargs: dict[str, Any],
         reflected: bool,
         partial_reordering: tuple = (),
+        column_migration_expressions: (
+            dict[str, ColumnElement[Any] | str] | None
+        ) = None,
     ) -> None:
         self.impl = impl
         self.table = table  # this is a Table object
@@ -235,6 +255,7 @@ class ApplyBatchImpl:
         self.table_kwargs = table_kwargs
         self.temp_table_name = self._calc_temp_name(table.name)
         self.new_table: Table | None = None
+        self.column_migration_expressions = column_migration_expressions
 
         self.partial_reordering = partial_reordering  # tuple of tuples
         self.add_col_ordering: tuple[
@@ -468,31 +489,44 @@ class ApplyBatchImpl:
                 )
 
     def _create(self, op_impl: DefaultImpl) -> None:
+        self._apply_column_migration_expressions()
         self._transfer_elements_to_new_table()
 
         op_impl.prep_table_for_batch(self, self.table)
         assert self.new_table is not None
         op_impl.create_table(self.new_table)
 
-        try:
-            op_impl._exec(
-                self.new_table.insert()
-                .inline()
-                .from_select(
-                    list(
-                        k
-                        for k, transfer in self.column_transfers.items()
+        insert_stmt: Any = (
+            self.new_table.insert()
+            .inline()
+            .from_select(
+                list(
+                    k
+                    for k, transfer in self.column_transfers.items()
+                    if "expr" in transfer
+                ),
+                select(
+                    *[
+                        transfer["expr"]
+                        for transfer in self.column_transfers.values()
                         if "expr" in transfer
-                    ),
-                    select(
-                        *[
-                            transfer["expr"]
-                            for transfer in self.column_transfers.values()
-                            if "expr" in transfer
-                        ]
-                    ),
+                    ]
+                ),
+            )
+        )
+        if op_impl.as_sql:
+            # column migration expressions may contain literal values;
+            # render them inline so that the generated offline SQL is
+            # directly executable
+            insert_stmt = str(
+                insert_stmt.compile(
+                    dialect=op_impl.dialect,
+                    compile_kwargs={"literal_binds": True},
                 )
             )
+
+        try:
+            op_impl._exec(insert_stmt)
             op_impl.drop_table(self.table)
         except:
             op_impl.drop_table(self.new_table)
@@ -507,6 +541,84 @@ class ApplyBatchImpl:
                     op_impl.create_index(idx)
             finally:
                 self.new_table.name = self.temp_table_name
+
+    def _apply_column_migration_expressions(self) -> None:
+        if not self.column_migration_expressions:
+            return
+
+        # column_transfers is keyed by the *original* column name; the
+        # mapping is keyed by the final column name, which differs when
+        # a column is renamed in the same batch.
+        final_name_to_key = {
+            transfer.get("name", key): key
+            for key, transfer in self.column_transfers.items()
+        }
+
+        for target_name, expr in self.column_migration_expressions.items():
+            try:
+                key = final_name_to_key[target_name]
+            except KeyError:
+                raise exc.CommandError(
+                    "Can't apply column migration expression for column "
+                    "%r; no column with that name will be present in the "
+                    "recreated table.  Column migration expressions are "
+                    "keyed by the final column name and may not target "
+                    "dropped columns." % (target_name,)
+                ) from None
+
+            column = self.columns[key]
+            if column.computed is not None:
+                raise exc.CommandError(
+                    "Can't apply column migration expression for column "
+                    "%r; generated columns are computed by the database "
+                    "and may not be written to directly." % (target_name,)
+                )
+
+            self.column_transfers[key]["expr"] = (
+                self._resolve_column_migration_expression(target_name, expr)
+            )
+
+    def _resolve_column_migration_expression(
+        self, target_name: str, expr: ColumnElement[Any] | str
+    ) -> ColumnElement[Any]:
+        if isinstance(expr, str):
+            # raw SQL is passed through as-is; column references
+            # can't be validated in this form
+            return text(expr)
+
+        source_table = self.table
+
+        def replace(elem: Any) -> Any:
+            if isinstance(elem, ColumnClause):
+                table = elem.table
+                if table is not None and not (
+                    table.name == source_table.name
+                    and (table.schema or None) == (source_table.schema or None)
+                ):
+                    raise exc.CommandError(
+                        "Can't apply column migration expression for "
+                        "column %r; the expression refers to column %r "
+                        "of table %r.  Column migration expressions are "
+                        "evaluated against the table being recreated and "
+                        "may not refer to other tables."
+                        % (target_name, elem.name, table.name)
+                    )
+                try:
+                    # rebind the column to the source table, so that
+                    # expressions built against a user-supplied Table
+                    # object or unbound column() clauses select from the
+                    # pre-recreate table only
+                    return source_table.c[elem.name]
+                except KeyError:
+                    raise exc.CommandError(
+                        "Can't apply column migration expression for "
+                        "column %r; the expression refers to column %r "
+                        "which is not present in the table being "
+                        "recreated." % (target_name, elem.name)
+                    ) from None
+            return None
+
+        return replacement_traverse(expr, {}, replace)
 
     def alter_column(
         self,

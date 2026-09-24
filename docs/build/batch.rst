@@ -285,6 +285,70 @@ by a batch migration.  Therefore it may be necessary to manipulate the
 ``PRAGMA FOREIGN KEYS`` setting if a migration seeks to rename a table vs.
 batch migrate it.
 
+.. _batch_column_migration_expressions:
+
+Transforming Column Values During the Copy
+------------------------------------------
+
+When the "move and copy" procedure runs, data is transferred to the new
+table using a single ``INSERT ... SELECT`` statement.  By default each
+column is copied as-is, or with an implicit ``CAST`` when its datatype
+changed.  The
+:paramref:`~.Operations.batch_alter_table.column_migration_expressions`
+parameter allows the SELECT expression for individual columns to be
+stated explicitly, so that values can be transformed by the database as
+they are copied::
+
+    with op.batch_alter_table(
+        "order",
+        column_migration_expressions={
+            "amount": sa.cast(
+                sa.func.nullif(sa.func.trim(sa.column("amount_text")), ""),
+                sa.Numeric(10, 2),
+            ),
+        },
+    ) as batch_op:
+        batch_op.alter_column(
+            "amount_text",
+            new_column_name="amount",
+            type_=sa.Numeric(10, 2),
+            existing_type=sa.String(),
+        )
+
+The mapping is keyed by the **final** column name of the recreated table,
+while each expression is evaluated by the database against the
+**original** table, before it is dropped.  The expressions are SQL
+expressions only; no row data is read into Python.  Columns that are not
+named in the mapping are copied using the default rules.  Some additional
+notes:
+
+* Expressions may refer to columns that are dropped by the same batch,
+  since the expression runs against the original table.
+
+* For a column added by the same batch, an explicit expression takes
+  precedence over the column's server default when existing rows are
+  copied; the server default still applies to rows inserted afterwards.
+
+* An explicit expression also takes precedence over the implicit
+  ``CAST`` that is normally applied when a column's type changes.
+
+* Expression targets are validated before the original table is altered
+  in any way.  Names that don't correspond to a column of the recreated
+  table (including dropped columns), generated columns, and expressions
+  that refer to other tables are rejected up front.  Plain strings are
+  passed through as raw SQL via :func:`~sqlalchemy.sql.expression.text`
+  and are not validated.
+
+* The copy runs inside the same transaction as the rest of the recreate.
+  If an expression fails or newly added constraints reject the copied
+  rows, the temporary table is discarded and the original table, its
+  data, and its indexes remain in place, provided the backend supports
+  transactional DDL (SQLite does).  Backends that implicitly commit
+  around DDL statements may not be able to roll a failed recreate back
+  cleanly.
+
+.. versionadded:: 1.21
+
 .. _batch_offline_mode:
 
 Working in Offline Mode

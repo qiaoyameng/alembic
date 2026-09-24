@@ -249,6 +249,9 @@ class AbstractOperations(util.ModuleClsProxy):
         reflect_args: tuple[Any, ...] = (),
         reflect_kwargs: Mapping[str, Any] = util.immutabledict(),
         naming_convention: dict[str, str] | None = None,
+        column_migration_expressions: (
+            Mapping[str, ColumnElement[Any] | str] | None
+        ) = None,
     ) -> Iterator[BatchOperations]:
         """Invoke a series of per-table migrations in batch.
 
@@ -379,6 +382,50 @@ class AbstractOperations(util.ModuleClsProxy):
          set is undefined.   Therefore it is best to specify the complete
          ordering of all columns for best results.
 
+        :param column_migration_expressions: a mapping of column names to
+         SQL expressions, used to populate those columns with transformed
+         values when the table is recreated using "move and copy" mode.
+         Keys refer to the **final** column names of the recreated table;
+         each expression is evaluated by the database against the
+         **original** table, as part of the ``INSERT ... SELECT`` that
+         copies the data.  Expressions are SQL expressions, not Python
+         functions; they are never evaluated against rows in Python.
+         E.g.::
+
+            with op.batch_alter_table(
+                "order",
+                column_migration_expressions={
+                    "amount": sa.cast(
+                        sa.func.nullif(sa.func.trim(sa.column("amount_text")), ""),
+                        sa.Numeric(10, 2),
+                    ),
+                },
+            ) as batch_op:
+                batch_op.alter_column(
+                    "amount_text",
+                    new_column_name="amount",
+                    type_=sa.Numeric(10, 2),
+                    existing_type=sa.String(),
+                )
+
+         Columns that are not named in the mapping are copied using the
+         default rules.  Expressions may refer to columns that are dropped
+         by the same batch, as the expression is evaluated against the
+         original table.  For a column added by the same batch, an explicit
+         expression takes precedence over the column's server default for
+         existing rows.  Targets that name an unknown column, a generated
+         column, or an expression that refers to another table are
+         rejected before the original table is altered in any way.
+
+         The copy takes place as a single ``INSERT ... SELECT`` statement
+         inside the same transaction as the rest of the recreate; if the
+         expression fails or new constraints reject the copied rows, the
+         original table, its data, and its indexes are left in place.
+         This assumes the backend in use supports transactional DDL,
+         which is the case for SQLite.
+
+         .. versionadded:: 1.21
+
         .. note:: batch mode requires SQLAlchemy 0.8 or above.
 
         .. seealso::
@@ -398,6 +445,7 @@ class AbstractOperations(util.ModuleClsProxy):
             reflect_kwargs,
             naming_convention,
             partial_reordering,
+            column_migration_expressions,
         )
         batch_op = BatchOperations(self.migration_context, impl=impl)
         yield batch_op
