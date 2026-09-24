@@ -285,6 +285,105 @@ by a batch migration.  Therefore it may be necessary to manipulate the
 ``PRAGMA FOREIGN KEYS`` setting if a migration seeks to rename a table vs.
 batch migrate it.
 
+.. _batch_column_transfers:
+
+Transforming Column Data During the Copy
+----------------------------------------
+
+When the "move and copy" process proceeds, data is transferred from the
+existing table to the new one using ``INSERT INTO new_table (...) SELECT
+... FROM existing_table``.  By default, each column that exists in both
+tables is copied as-is, with an automatic ``CAST`` added only when the
+type affinity of a column changes.   The
+:paramref:`~.Operations.batch_alter_table.column_transfers` parameter
+allows the SELECT expression used for individual columns to be stated
+explicitly, so that values can be transformed, cleaned up, or derived
+from other columns as part of the copy.  The expressions are evaluated
+**by the database**, against the *existing* table, as part of the single
+copy statement; no data is pulled into Python.
+
+The mapping is keyed by column names in the **new** table, i.e. after
+any renames and additions have been applied.  A typical use case is
+converting a textual column to a numeric one while renaming it::
+
+    from sqlalchemy import cast, func, Numeric
+    from sqlalchemy.sql import column
+
+    with op.batch_alter_table(
+        "some_table",
+        column_transfers={
+            "amount": cast(
+                func.nullif(func.trim(column("amount_text")), ""), Numeric
+            ),
+        },
+    ) as batch_op:
+        batch_op.alter_column(
+            "amount_text",
+            new_column_name="amount",
+            type_=Numeric(),
+            existing_type=String(),
+        )
+
+Another use case is backfilling a newly added, non-nullable column from
+the contents of existing rows.  An explicit transfer expression for an
+added column takes precedence over the column's server default for the
+rows being copied (the server default still applies to subsequent
+inserts)::
+
+    with op.batch_alter_table(
+        "some_table",
+        column_transfers={
+            "amount_cents": cast(
+                func.coalesce(column("amount") * 100, 0), Integer
+            ),
+        },
+    ) as batch_op:
+        batch_op.add_column(
+            Column("amount_cents", Integer, server_default="0",
+                   nullable=False)
+        )
+
+Values in the mapping may be SQLAlchemy SQL expressions or plain strings;
+a string is interpreted as the name of a column in the existing table.
+Unbound column references such as ``column("amount_text")`` are resolved
+against the table being copied.  The following rules apply:
+
+* Columns that are **dropped** by the batch may be referenced by transfer
+  expressions (they still exist in the existing table), but may not be
+  used as targets.
+
+* **Generated** (computed) columns may not be targets, as they cannot
+  accept inserted values.
+
+* Expressions may only refer to columns of the table being copied;
+  references to other tables are rejected.
+
+* Columns not named in the mapping are copied using the default rules.
+
+Using ``column_transfers`` implies that the table is recreated, even if
+the batch would otherwise consist only of ``add_column()`` operations;
+it may not be combined with ``recreate="never"``.
+
+All target names and expressions are validated **before** any DDL is
+emitted, so an unknown target name or an invalid reference never reaches
+the database.  The copy itself, including evaluation of the expressions
+and enforcement of the new table's constraints, takes place **before**
+the original table is dropped; if the copy fails, the original table,
+its data and its indexes remain in place and the error is propagated,
+so the migration is not treated as successful.
+
+.. note::  Transactional guarantees during "move and copy" depend on
+   the backend's support for transactional DDL.  On SQLite with the
+   ``pysqlite`` driver, DDL statements such as ``CREATE TABLE`` are not
+   rolled back with the surrounding transaction; a batch operation that
+   fails partway through may therefore leave an empty temporary table
+   named ``_alembic_tmp_<tablename>`` behind, which may be dropped
+   manually.  The original table is never dropped or renamed unless the
+   data copy, including all transfer expressions, has completed
+   successfully.
+
+.. versionadded:: 1.21
+
 .. _batch_offline_mode:
 
 Working in Offline Mode
@@ -319,6 +418,12 @@ preferred style of working; however, if one needs to do SQLite-compatible
 "move and copy" migrations and need them to generate flat SQL files in
 "offline" mode, there's not much alternative.
 
+The :paramref:`~.Operations.batch_alter_table.column_transfers` parameter
+(see :ref:`batch_column_transfers`) may be used in offline mode as well,
+as long as :paramref:`~.Operations.batch_alter_table.copy_from` is given;
+literal values within the transfer expressions are rendered inline into
+the generated ``INSERT INTO ... SELECT`` statement so that the script
+remains directly executable.
 
 Batch mode with Autogenerate
 ----------------------------

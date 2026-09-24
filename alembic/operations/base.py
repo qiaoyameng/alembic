@@ -244,6 +244,9 @@ class AbstractOperations(util.ModuleClsProxy):
         recreate: Literal["auto", "always", "never"] = "auto",
         partial_reordering: list[tuple[str, ...]] | None = None,
         copy_from: Table | None = None,
+        column_transfers: (
+            Mapping[str, str | ColumnElement[Any] | TextClause] | None
+        ) = None,
         table_args: tuple[Any, ...] = (),
         table_kwargs: Mapping[str, Any] = util.immutabledict(),
         reflect_args: tuple[Any, ...] = (),
@@ -318,6 +321,47 @@ class AbstractOperations(util.ModuleClsProxy):
             :paramref:`~.Operations.batch_alter_table.reflect_args`
 
             :paramref:`~.Operations.batch_alter_table.reflect_kwargs`
+
+        :param column_transfers: optional mapping of final (post-recreate)
+         column names to SQL expressions, textual SQL fragments, or string
+         names of source columns,
+         used to populate those columns when data is copied from the existing
+         table to the new one in "recreate" mode.  Expressions are evaluated
+         by the database against the *existing* table as part of the
+         ``INSERT INTO ... SELECT`` copy statement; they are not Python-side
+         callbacks.  E.g.::
+
+            with op.batch_alter_table(
+                "some_table",
+                column_transfers={
+                    "amount": cast(
+                        nullif(trim(column("amount_text")), ""), Numeric
+                    ),
+                },
+            ) as batch_op:
+                batch_op.alter_column(
+                    "amount_text",
+                    new_column_name="amount",
+                    type_=Numeric(),
+                    existing_type=String(),
+                )
+
+         Keys refer to column names in the *new* table, after any renames
+         and additions; columns that are dropped by the batch may be
+         referenced by the expressions, but may not be targets.  An
+         explicit transfer expression for a newly added column takes
+         precedence over that column's server default when existing rows
+         are copied.  Generated (computed) columns may not be targets.
+         Columns that are not named in the mapping are copied using the
+         default rules.  Using this parameter implies that the table is
+         recreated, even for batches that would otherwise not require it;
+         it cannot be combined with ``recreate="never"``.
+
+         .. versionadded:: 1.21
+
+         .. seealso::
+
+            :ref:`batch_column_transfers`
 
         :param reflect_args: a sequence of additional positional arguments that
          will be applied to the table structure being reflected / copied;
@@ -398,6 +442,7 @@ class AbstractOperations(util.ModuleClsProxy):
             reflect_kwargs,
             naming_convention,
             partial_reordering,
+            column_transfers=column_transfers,
         )
         batch_op = BatchOperations(self.migration_context, impl=impl)
         yield batch_op

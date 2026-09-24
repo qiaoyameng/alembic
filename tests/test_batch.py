@@ -1,14 +1,18 @@
 from contextlib import contextmanager
 import random
 import re
+import shutil
+import sqlite3
 
 from sqlalchemy import Boolean
+from sqlalchemy import cast
 from sqlalchemy import CheckConstraint
 from sqlalchemy import Column
 from sqlalchemy import Computed
 from sqlalchemy import DateTime
 from sqlalchemy import Enum
 from sqlalchemy import exc as sqla_exc
+from sqlalchemy import Float
 from sqlalchemy import ForeignKey
 from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy import func
@@ -48,6 +52,7 @@ from alembic.testing import is_
 from alembic.testing import mock
 from alembic.testing import TestBase
 from alembic.testing.env import _no_sql_testing_config
+from alembic.testing.env import _sqlite_testing_config
 from alembic.testing.env import clear_staging_env
 from alembic.testing.env import staging_env
 from alembic.testing.env import write_script
@@ -1344,6 +1349,196 @@ class CopyFromTest(TestBase):
             "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
         )
 
+    def test_column_transfers_rename_w_transform(self):
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            column_transfers={
+                "amount": cast(
+                    func.nullif(func.trim(column("data")), ""), Integer
+                )
+            },
+        ) as batch_op:
+            batch_op.alter_column(
+                "data",
+                new_column_name="amount",
+                type_=Integer,
+                existing_type=String(50),
+            )
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "amount INTEGER, x INTEGER, PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, amount, x) SELECT foo.id, "
+            "CAST(nullif(trim(foo.data), '') AS INTEGER) AS nullif_1, "
+            "foo.x FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_column_transfers_add_column_backfill(self):
+        # the explicit transfer expression takes precedence over the
+        # server default when existing rows are copied
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            column_transfers={"y": column("x") * 2},
+        ) as batch_op:
+            batch_op.add_column(
+                Column("y", Integer, server_default="0", nullable=False)
+            )
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "data VARCHAR(50), x INTEGER, y INTEGER DEFAULT '0' NOT NULL, "
+            "PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, data, x, y) SELECT foo.id, "
+            "foo.data, foo.x, foo.x * 2 AS anon_1 FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_column_transfers_string_source_column(self):
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            column_transfers={"x": "data", "data": column("x")},
+        ) as batch_op:
+            batch_op.alter_column(
+                "x", type_=String(10), existing_type=Integer
+            )
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "data VARCHAR(50), x VARCHAR(10), PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, data, x) SELECT foo.id, "
+            "foo.x, foo.data FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_column_transfers_dropped_column_as_source(self):
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            column_transfers={"data": func.upper(column("data"))},
+        ) as batch_op:
+            batch_op.drop_column("x")
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "data VARCHAR(50), PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, data) SELECT foo.id, "
+            "upper(foo.data) AS upper_1 FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_column_transfers_unknown_target(self):
+        self._fixture()
+        with expect_raises_message(
+            alembic_exc.CommandError,
+            "Can't transfer data to column 'q': no such column in the "
+            "new .recreated. table",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                column_transfers={"q": column("x")},
+            ) as batch_op:
+                batch_op.drop_column("data")
+
+    def test_column_transfers_dropped_column_as_target(self):
+        self._fixture()
+        with expect_raises_message(
+            alembic_exc.CommandError,
+            "Can't transfer data to column 'data': the column is dropped "
+            "by this batch operation",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                column_transfers={"data": column("x")},
+            ) as batch_op:
+                batch_op.drop_column("data")
+
+    def test_column_transfers_generated_column_as_target(self):
+        self._fixture()
+        with expect_raises_message(
+            alembic_exc.CommandError,
+            "Can't transfer data to column 'gen': the column is a "
+            "generated column",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                column_transfers={"gen": column("x")},
+            ) as batch_op:
+                batch_op.add_column(Column("gen", Integer, Computed("x * 2")))
+
+    def test_column_transfers_cross_table_reference(self):
+        self._fixture()
+        other = Table(
+            "other", MetaData(), Column("id", Integer), Column("x", Integer)
+        )
+        with expect_raises_message(
+            alembic_exc.CommandError,
+            "transfer expressions may only refer to columns of the "
+            "table being copied",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                column_transfers={"x": other.c.x},
+            ) as batch_op:
+                batch_op.alter_column(
+                    "x", type_=String(10), existing_type=Integer
+                )
+
+    def test_column_transfers_unknown_source_column(self):
+        self._fixture()
+        with expect_raises_message(
+            alembic_exc.CommandError,
+            "no column named 'missing' exists in table 'foo'",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                column_transfers={"x": column("missing")},
+            ) as batch_op:
+                batch_op.alter_column(
+                    "x", type_=String(10), existing_type=Integer
+                )
+
+    def test_column_transfers_unknown_string_source_column(self):
+        self._fixture()
+        with expect_raises_message(
+            alembic_exc.CommandError,
+            "no column named 'missing' exists in table 'foo'",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                column_transfers={"x": "missing"},
+            ) as batch_op:
+                batch_op.alter_column(
+                    "x", type_=String(10), existing_type=Integer
+                )
+
+    def test_column_transfers_recreate_never(self):
+        self._fixture()
+        with expect_raises_message(
+            alembic_exc.CommandError,
+            "it cannot be combined with recreate='never'",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                recreate="never",
+                column_transfers={"x": column("data")},
+            ) as batch_op:
+                batch_op.add_column(Column("y", Integer))
+
 
 class _BatchRoundTripBase:
     """common fixtures for the batch round trip tests.
@@ -2551,6 +2746,241 @@ class BatchRoundTripPostgresqlTest(BatchRoundTripTest):
         )
 
 
+class BatchColumnTransferRoundTripTest(_BatchRoundTripBase, TestBase):
+    """Round trip tests for the ``column_transfers`` parameter of
+    :meth:`.Operations.batch_alter_table`, against a real SQLite
+    database.
+
+    """
+
+    __only_on__ = "sqlite"
+
+    @testing.fixture(autouse=True)
+    def amounts_fixture(self, metadata, connection):
+        t = Table(
+            "amounts",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("amount_text", String(50)),
+            Column("note", String(50)),
+        )
+        with connection.begin():
+            t.create(connection)
+            connection.execute(
+                t.insert(),
+                [
+                    {"id": 1, "amount_text": " 12.5 ", "note": "a"},
+                    {"id": 2, "amount_text": "", "note": "b"},
+                    {"id": 3, "amount_text": None, "note": "c"},
+                    {"id": 4, "amount_text": "7", "note": "d"},
+                ],
+            )
+        return t
+
+    def _amounts_data(self, connection, col):
+        return connection.execute(
+            text(f"select id, {col} from amounts order by id")
+        ).fetchall()
+
+    def test_rename_with_transform(self, connection):
+        with self.op.batch_alter_table(
+            "amounts",
+            column_transfers={
+                "amount": cast(
+                    func.nullif(func.trim(column("amount_text")), ""), Float
+                )
+            },
+        ) as batch_op:
+            batch_op.alter_column(
+                "amount_text",
+                new_column_name="amount",
+                type_=Float,
+                existing_type=String(50),
+            )
+
+        eq_(
+            self._amounts_data(connection, "amount"),
+            [(1, 12.5), (2, None), (3, None), (4, 7.0)],
+        )
+        eq_(
+            [
+                c["name"]
+                for c in inspect(connection).get_columns("amounts")
+            ],
+            ["id", "amount", "note"],
+        )
+
+    def test_add_not_null_column_backfill(self, connection):
+        # the explicit transfer expression takes precedence over the
+        # server default for the rows being copied
+        with self.op.batch_alter_table(
+            "amounts",
+            column_transfers={
+                "amount_cents": cast(
+                    func.coalesce(
+                        cast(
+                            func.nullif(func.trim(column("amount_text")), ""),
+                            Float,
+                        )
+                        * 100,
+                        -1,
+                    ),
+                    Integer,
+                )
+            },
+        ) as batch_op:
+            batch_op.add_column(
+                Column(
+                    "amount_cents",
+                    Integer,
+                    server_default="0",
+                    nullable=False,
+                )
+            )
+
+        eq_(
+            self._amounts_data(connection, "amount_cents"),
+            [(1, 1250), (2, -1), (3, -1), (4, 700)],
+        )
+
+        # the server default still applies to new rows
+        _safe_commit_connection_transaction(connection)
+        with connection.begin():
+            connection.execute(
+                text("insert into amounts (id, amount_text) values (5, '9')")
+            )
+        eq_(
+            connection.execute(
+                text("select amount_cents from amounts where id = 5")
+            ).scalar(),
+            0,
+        )
+
+    def test_dropped_column_as_source(self, connection):
+        with self.op.batch_alter_table(
+            "amounts",
+            column_transfers={"amount": cast(column("amount_text"), Float)},
+        ) as batch_op:
+            batch_op.add_column(Column("amount", Float))
+            batch_op.drop_column("amount_text")
+
+        eq_(
+            self._amounts_data(connection, "amount"),
+            [(1, 12.5), (2, 0.0), (3, None), (4, 7.0)],
+        )
+        eq_(
+            [
+                c["name"]
+                for c in inspect(connection).get_columns("amounts")
+            ],
+            ["id", "note", "amount"],
+        )
+
+    def test_plain_batch_no_transfers(self, connection):
+        # migrations that don't use column_transfers are unaffected
+        with self.op.batch_alter_table("amounts") as batch_op:
+            batch_op.alter_column(
+                "amount_text",
+                new_column_name="amount",
+                existing_type=String(50),
+            )
+
+        eq_(
+            self._amounts_data(connection, "amount"),
+            [(1, " 12.5 "), (2, ""), (3, None), (4, "7")],
+        )
+
+    def test_constraint_failure_original_intact(
+        self, amounts_fixture, connection
+    ):
+        ix = Index("ix_amount_text", amounts_fixture.c.amount_text)
+        with connection.begin():
+            ix.create(connection)
+
+        with expect_raises_message(
+            sqla_exc.IntegrityError, "CHECK constraint failed"
+        ):
+            with self.op.batch_alter_table(
+                "amounts",
+                column_transfers={
+                    "amount": cast(column("amount_text"), Integer)
+                },
+                table_args=(
+                    CheckConstraint("amount > 100", name="ck_amount"),
+                ),
+            ) as batch_op:
+                batch_op.alter_column(
+                    "amount_text",
+                    new_column_name="amount",
+                    type_=Integer,
+                    existing_type=String(50),
+                )
+
+        _safe_rollback_connection_transaction(connection)
+
+        # the original table, its data and its indexes are still usable
+        eq_(
+            self._amounts_data(connection, "amount_text"),
+            [(1, " 12.5 "), (2, ""), (3, None), (4, "7")],
+        )
+        eq_(
+            [
+                ix["name"]
+                for ix in inspect(connection).get_indexes("amounts")
+            ],
+            ["ix_amount_text"],
+        )
+        eq_(
+            [
+                c["name"]
+                for c in inspect(connection).get_columns("amounts")
+            ],
+            ["id", "amount_text", "note"],
+        )
+
+        # SQLite's pysqlite driver does not run DDL transactionally,
+        # so the temporary table may be left behind; drop it so that
+        # test teardown doesn't see it
+        connection.exec_driver_sql("DROP TABLE IF EXISTS _alembic_tmp_amounts")
+        _safe_commit_connection_transaction(connection)
+
+    def test_outer_transaction_rollback(self, connection):
+        trans = connection.begin()
+        with self.op.batch_alter_table(
+            "amounts",
+            column_transfers={
+                "amount": cast(
+                    func.nullif(func.trim(column("amount_text")), ""), Float
+                )
+            },
+        ) as batch_op:
+            batch_op.alter_column(
+                "amount_text",
+                new_column_name="amount",
+                type_=Float,
+                existing_type=String(50),
+            )
+        trans.rollback()
+
+        # the original table and its data are restored
+        eq_(
+            [
+                c["name"]
+                for c in inspect(connection).get_columns("amounts")
+            ],
+            ["id", "amount_text", "note"],
+        )
+        eq_(
+            self._amounts_data(connection, "amount_text"),
+            [(1, " 12.5 "), (2, ""), (3, None), (4, "7")],
+        )
+
+        # as above, clean up the temporary table that SQLite's
+        # non-transactional DDL leaves behind
+        connection.exec_driver_sql("DROP TABLE IF EXISTS _alembic_tmp_amounts")
+        _safe_commit_connection_transaction(connection)
+
+
 class BatchNamingConventionTest(_BatchRoundTripBase, TestBase):
     """test the interaction of naming conventions with batch "recreate".
 
@@ -3057,3 +3487,142 @@ class OfflineTest(TestBase):
         assert re.search(
             r"CREATE TABLE _alembic_tmp_some_table", buf.getvalue()
         )
+
+    @testing.fixture
+    def column_transfers_offline_fixture(self):
+        staging_env()
+
+        def go():
+            self.cfg = cfg = _sqlite_testing_config()
+
+            self.a = a = util.rev_id()
+
+            script = ScriptDirectory.from_config(cfg)
+            script.generate_revision(
+                a, "revision a", refresh=True, head="base"
+            )
+            write_script(
+                script,
+                a,
+                """\
+    "Rev A"
+    revision = '%s'
+    down_revision = None
+
+    from alembic import op
+    from sqlalchemy import cast
+    from sqlalchemy import Column
+    from sqlalchemy import Float
+    from sqlalchemy import func
+    from sqlalchemy import Integer
+    from sqlalchemy import String, Table, MetaData
+    from sqlalchemy.sql import column
+
+    copy_from = Table(
+        "t", MetaData(),
+        Column("id", Integer, primary_key=True),
+        Column("amount_text", String(50)),
+        Column("note", String(50)),
+    )
+
+    def upgrade():
+        with op.batch_alter_table(
+            "t",
+            copy_from=copy_from,
+            column_transfers={
+                "amount": cast(
+                    func.nullif(func.trim(column("amount_text")), ""), Float
+                ),
+                "note_upper": func.upper(column("note")),
+            },
+        ) as batch_op:
+            batch_op.alter_column(
+                "amount_text",
+                new_column_name="amount",
+                type_=Float,
+                existing_type=String(50),
+            )
+            batch_op.drop_column("note")
+            batch_op.add_column(Column("note_upper", String(50)))
+
+    """ % a,  # noqa: E501
+            )
+
+        yield go
+        clear_staging_env()
+
+    def _db_path(self):
+        url = self.cfg.get_main_option("sqlalchemy.url")
+        assert url.startswith("sqlite:///")
+        return url[len("sqlite:///") :]
+
+    def _dump_db(self, path):
+        db = sqlite3.connect(path)
+        try:
+            tables = [
+                row[0]
+                for row in db.execute(
+                    "select name from sqlite_master where type = 'table' "
+                    "and name not like 'sqlite_%%' order by name"
+                )
+            ]
+            dump = {}
+            for table in tables:
+                cols = db.execute(
+                    f"pragma table_info({table})"
+                ).fetchall()
+                rows = db.execute(f"select * from {table}").fetchall()
+                dump[table] = (
+                    cols,
+                    sorted(rows, key=lambda row: str(row)),
+                )
+            return dump
+        finally:
+            db.close()
+
+    def test_column_transfers_offline_sql_matches_online(
+        self, column_transfers_offline_fixture
+    ):
+        column_transfers_offline_fixture()
+
+        db_path = self._db_path()
+
+        # set up the "old" schema and data
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "create table t (id integer primary key, "
+            "amount_text varchar(50), note varchar(50))"
+        )
+        db.executemany(
+            "insert into t values (?, ?, ?)",
+            [(1, " 12.5 ", "x"), (2, "", "y"), (3, None, None)],
+        )
+        db.commit()
+        db.close()
+
+        # a copy of the database, to be migrated using the
+        # generated offline SQL
+        copy_path = "%s.copy" % db_path
+        shutil.copy(db_path, copy_path)
+
+        # migrate the original online
+        command.upgrade(self.cfg, "head")
+
+        # generate the offline SQL for the same migration
+        with capture_context_buffer() as buf:
+            command.upgrade(self.cfg, self.a, sql=True)
+
+        # apply the offline SQL to the copy
+        db = sqlite3.connect(copy_path)
+        db.executescript(buf.getvalue())
+        db.close()
+
+        # the transformed data is as expected ...
+        eq_(
+            self._dump_db(copy_path)["t"][1],
+            [(1, 12.5, "X"), (2, None, "Y"), (3, None, None)],
+        )
+
+        # ... and the result of the offline SQL is identical to the
+        # online migration
+        eq_(self._dump_db(copy_path), self._dump_db(db_path))

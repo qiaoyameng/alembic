@@ -16,6 +16,10 @@ from sqlalchemy import schema as sql_schema
 from sqlalchemy import select
 from sqlalchemy import Table
 from sqlalchemy import types as sqltypes
+from sqlalchemy.sql import visitors
+from sqlalchemy.sql.elements import ColumnClause
+from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.elements import TextClause
 from sqlalchemy.sql.schema import SchemaEventTarget
 from sqlalchemy.util import OrderedDict
 from sqlalchemy.util import topological
@@ -42,7 +46,6 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from sqlalchemy.engine import Dialect
-    from sqlalchemy.sql.elements import ColumnClause
     from sqlalchemy.sql.elements import quoted_name
     from sqlalchemy.sql.schema import Constraint
     from sqlalchemy.sql.type_api import TypeEngine
@@ -65,6 +68,7 @@ class BatchOperationsImpl:
         reflect_kwargs,
         naming_convention,
         partial_reordering,
+        column_transfers=None,
     ):
         self.operations = operations
         self.table_name = table_name
@@ -87,6 +91,9 @@ class BatchOperationsImpl:
         )
         self.naming_convention = naming_convention
         self.partial_reordering = partial_reordering
+        self.column_transfers = (
+            dict(column_transfers) if column_transfers else {}
+        )
         self.batch = []
 
     @property
@@ -99,7 +106,12 @@ class BatchOperationsImpl:
 
     def _should_recreate(self) -> bool:
         if self.recreate == "auto":
-            return self.operations.impl.requires_recreate_in_batch(self)
+            # explicit column transfers can only be applied by
+            # recreating the table
+            return (
+                bool(self.column_transfers)
+                or self.operations.impl.requires_recreate_in_batch(self)
+            )
         elif self.recreate == "always":
             return True
         else:
@@ -110,6 +122,12 @@ class BatchOperationsImpl:
 
         with _ensure_scope_for_ddl(self.impl.connection):
             if not should_recreate:
+                if self.column_transfers:
+                    raise exc.CommandError(
+                        "The 'column_transfers' argument requires the "
+                        "table to be recreated; it cannot be combined "
+                        "with recreate='never'."
+                    )
                 for opname, arg, kw in self.batch:
                     fn = getattr(self.operations.impl, opname)
                     fn(*arg, **kw)
@@ -165,6 +183,7 @@ class BatchOperationsImpl:
                     self.table_kwargs,
                     reflected,
                     partial_reordering=self.partial_reordering,
+                    column_transfers=self.column_transfers,
                 )
                 for opname, arg, kw in self.batch:
                     fn = getattr(batch_impl, opname)
@@ -228,6 +247,7 @@ class ApplyBatchImpl:
         table_kwargs: dict[str, Any],
         reflected: bool,
         partial_reordering: tuple = (),
+        column_transfers: dict[str, Any] | None = None,
     ) -> None:
         self.impl = impl
         self.table = table  # this is a Table object
@@ -235,6 +255,12 @@ class ApplyBatchImpl:
         self.table_kwargs = table_kwargs
         self.temp_table_name = self._calc_temp_name(table.name)
         self.new_table: Table | None = None
+
+        # user-supplied explicit transfer expressions, keyed by
+        # final (post-recreate) column name
+        self.user_column_transfers = (
+            column_transfers if column_transfers else {}
+        )
 
         self.partial_reordering = partial_reordering  # tuple of tuples
         self.add_col_ordering: tuple[
@@ -468,6 +494,7 @@ class ApplyBatchImpl:
                 )
 
     def _create(self, op_impl: DefaultImpl) -> None:
+        self._apply_user_column_transfers()
         self._transfer_elements_to_new_table()
 
         op_impl.prep_table_for_batch(self, self.table)
@@ -475,7 +502,19 @@ class ApplyBatchImpl:
         op_impl.create_table(self.new_table)
 
         try:
-            op_impl._exec(
+            select_stmt = select(
+                *[
+                    transfer["expr"]
+                    for transfer in self.column_transfers.values()
+                    if "expr" in transfer
+                ]
+            )
+            if self.user_column_transfers:
+                # user-supplied expressions may be textual or otherwise
+                # not bound to the source table; ensure the SELECT has
+                # a FROM clause referring to the table being copied
+                select_stmt = select_stmt.select_from(self.table)
+            insert_stmt = (
                 self.new_table.insert()
                 .inline()
                 .from_select(
@@ -484,15 +523,23 @@ class ApplyBatchImpl:
                         for k, transfer in self.column_transfers.items()
                         if "expr" in transfer
                     ),
-                    select(
-                        *[
-                            transfer["expr"]
-                            for transfer in self.column_transfers.values()
-                            if "expr" in transfer
-                        ]
-                    ),
+                    select_stmt,
                 )
             )
+            if op_impl.as_sql and self.user_column_transfers:
+                # user-supplied transfer expressions may contain
+                # literal values; render them inline so that the
+                # generated SQL is directly executable
+                op_impl._exec(
+                    str(
+                        insert_stmt.compile(
+                            dialect=op_impl.dialect,
+                            compile_kwargs={"literal_binds": True},
+                        )
+                    )
+                )
+            else:
+                op_impl._exec(insert_stmt)
             op_impl.drop_table(self.table)
         except:
             op_impl.drop_table(self.new_table)
@@ -507,6 +554,123 @@ class ApplyBatchImpl:
                     op_impl.create_index(idx)
             finally:
                 self.new_table.name = self.temp_table_name
+
+    def _apply_user_column_transfers(self) -> None:
+        """Apply user-supplied transfer expressions to the column
+        transfers, validating targets and expressions before any
+        DDL has been emitted against the database.
+
+        """
+        if not self.user_column_transfers:
+            return
+
+        # map final column names to transfer keys; for a renamed column
+        # the transfer key remains the original column name while
+        # transfer["name"] holds the new name
+        final_column_keys = {}
+        for key, transfer in self.column_transfers.items():
+            final_column_keys[transfer.get("name", key)] = key
+
+        source_column_names = {c.name for c in self.table.c}
+
+        for target_name, expr in self.user_column_transfers.items():
+            if target_name not in final_column_keys:
+                if target_name in source_column_names:
+                    raise exc.CommandError(
+                        f"Can't transfer data to column "
+                        f"'{target_name}': the column is dropped by this "
+                        "batch operation.  Column transfer targets are "
+                        "named after columns in the new (recreated) "
+                        "table; dropped columns may only be referenced "
+                        "by transfer expressions."
+                    )
+                raise exc.CommandError(
+                    f"Can't transfer data to column '{target_name}': "
+                    "no such column in the new (recreated) table.  "
+                    "Column transfer targets are named after final "
+                    "column names, including renames and added columns."
+                )
+            key = final_column_keys[target_name]
+            column = self.columns[key]
+            if column.computed is not None:
+                raise exc.CommandError(
+                    f"Can't transfer data to column '{target_name}': "
+                    "the column is a generated column and cannot "
+                    "accept inserted values."
+                )
+            self.column_transfers[key]["expr"] = (
+                self._coerce_transfer_expr(target_name, expr)
+            )
+
+    def _coerce_transfer_expr(
+        self, target_name: str, expr: Any
+    ) -> ColumnElement[Any]:
+        if isinstance(expr, str):
+            # a plain string refers to a column of the source table
+            try:
+                return self.table.c[expr]
+            except KeyError:
+                raise exc.CommandError(
+                    f"Can't transfer data to column '{target_name}': "
+                    f"no column named '{expr}' exists in table "
+                    f"'{self.table.name}'."
+                ) from None
+        if isinstance(expr, TextClause):
+            # a textual SQL fragment is used as-is; its column
+            # references can't be validated
+            return expr  # type: ignore[return-value]
+        if not isinstance(expr, ColumnElement):
+            raise exc.CommandError(
+                f"Can't transfer data to column '{target_name}': "
+                "expected a SQL expression or a string column name, "
+                f"got {expr!r}."
+            )
+        return self._bind_transfer_expr(target_name, expr)
+
+    def _bind_transfer_expr(
+        self, target_name: str, expr: ColumnElement[Any]
+    ) -> ColumnElement[Any]:
+        """Validate a user-supplied transfer expression and rebind its
+        column references to the source table being copied.
+
+        """
+        source_table = self.table
+
+        def replace(node):
+            if isinstance(node, Column):
+                table = node.table
+                if table is source_table:
+                    return None
+                if table is not None and (
+                    table.name != source_table.name
+                    or table.schema != source_table.schema
+                ):
+                    raise exc.CommandError(
+                        f"Can't transfer data to column "
+                        f"'{target_name}': expression refers to column "
+                        f"'{node.name}' of table "
+                        f"'{table.description}'; transfer expressions "
+                        "may only refer to columns of the table being "
+                        "copied."
+                    )
+                name = node.name
+            elif isinstance(node, ColumnClause):
+                if node.is_literal:
+                    return None
+                name = node.name
+            else:
+                return None
+
+            try:
+                return source_table.c[name]
+            except KeyError:
+                raise exc.CommandError(
+                    f"Can't transfer data to column '{target_name}': "
+                    f"no column named '{name}' exists in table "
+                    f"'{source_table.name}'."
+                ) from None
+
+        return visitors.replacement_traverse(expr, {}, replace)
 
     def alter_column(
         self,
