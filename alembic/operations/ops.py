@@ -2415,6 +2415,143 @@ class DropColumnOp(AlterTableOp):
         return operations.invoke(op)
 
 
+@Operations.register_operation("create_view")
+class CreateViewOp(MigrateOperation):
+    """Represent a create view operation."""
+
+    def __init__(
+        self,
+        view_name: str,
+        selectable: str,
+        *,
+        depends_on: Sequence[str] = (),
+    ) -> None:
+        self.view_name = view_name
+        self.selectable = selectable
+        self.depends_on = tuple(depends_on)
+
+    def reverse(self) -> DropViewOp:
+        return DropViewOp(
+            self.view_name,
+            selectable=self.selectable,
+            depends_on=self.depends_on,
+        )
+
+    def to_diff_tuple(self) -> tuple[str, str, str]:
+        return ("add_view", self.view_name, self.selectable)
+
+    @classmethod
+    def create_view(
+        cls,
+        operations: Operations,
+        view_name: str,
+        selectable: str,
+        *,
+        depends_on: Sequence[str] = (),
+    ) -> None:
+        r"""Issue a "CREATE VIEW" instruction using the current
+        migration context.
+
+        e.g.::
+
+            from alembic import op
+
+            op.create_view(
+                "v_summary",
+                "SELECT id, upper(data) AS data FROM base_table",
+            )
+
+        This first version of view support targets plain SQL views, e.g.
+        SQLite ``CREATE VIEW``.  Materialized views and routines are not
+        supported.
+
+        :param view_name: name of the view to create.  The name is quoted
+         appropriately for the target dialect.
+        :param selectable: the SQL ``SELECT`` statement for the view, as a
+         plain string.  The statement is used verbatim; it should not
+         include a ``CREATE VIEW`` wrapper.
+        :param depends_on: optional sequence of names of other managed
+         views this view depends upon.  This is declarative metadata only;
+         when operations are written by hand, views must be created in
+         dependency order explicitly.
+
+        .. seealso::
+
+            :meth:`.Operations.drop_view`
+
+        """
+        op = cls(view_name, selectable, depends_on=depends_on)
+        return operations.invoke(op)
+
+
+@Operations.register_operation("drop_view")
+class DropViewOp(MigrateOperation):
+    """Represent a drop view operation."""
+
+    def __init__(
+        self,
+        view_name: str,
+        *,
+        selectable: str | None = None,
+        depends_on: Sequence[str] = (),
+    ) -> None:
+        self.view_name = view_name
+        self.selectable = selectable
+        self.depends_on = tuple(depends_on)
+
+    def reverse(self) -> CreateViewOp:
+        if self.selectable is None:
+            raise util.CommandError(
+                "Can't reverse a drop_view() operation for view "
+                f"{self.view_name!r} that does not include the SELECT "
+                "statement of the previously existing view; pass the "
+                "'selectable' parameter to make the operation reversible."
+            )
+        return CreateViewOp(
+            self.view_name, self.selectable, depends_on=self.depends_on
+        )
+
+    def to_diff_tuple(self) -> tuple[str, str]:
+        return ("remove_view", self.view_name)
+
+    @classmethod
+    def drop_view(
+        cls,
+        operations: Operations,
+        view_name: str,
+        *,
+        selectable: str | None = None,
+        depends_on: Sequence[str] = (),
+    ) -> None:
+        r"""Issue a "DROP VIEW" instruction using the current
+        migration context.
+
+        e.g.::
+
+            from alembic import op
+
+            op.drop_view("v_summary")
+
+        :param view_name: name of the view to drop.  The name is quoted
+         appropriately for the target dialect.
+        :param selectable: optional SQL ``SELECT`` statement of the view
+         being dropped.  When autogenerate emits this operation, the
+         statement is read from the database so that the downgrade
+         direction can recreate the view.  When writing operations by
+         hand, pass the previous SELECT here to make the operation
+         reversible.
+        :param depends_on: optional sequence of names of other managed
+         views this view depends upon; declarative metadata only.
+
+        .. seealso::
+
+            :meth:`.Operations.create_view`
+
+        """
+        op = cls(view_name, selectable=selectable, depends_on=depends_on)
+        return operations.invoke(op)
+
+
 @Operations.register_operation("bulk_insert")
 class BulkInsertOp(MigrateOperation):
     """Represent a bulk insert operation."""

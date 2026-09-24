@@ -40,6 +40,26 @@ _ServerDefaultType = Union[FetchedValue, str, TextClause, ColumnElement[Any]]
 _ServerDefaultArgument = Union[_ServerDefaultType, Literal[False], None]
 
 
+class CreateView(DDLElement):
+    """Represent a CREATE VIEW statement.
+
+    Only the string name of the view and the SELECT statement
+    text are required.
+
+    """
+
+    def __init__(self, view_name: str, selectable: str) -> None:
+        self.view_name = view_name
+        self.selectable = selectable
+
+
+class DropView(DDLElement):
+    """Represent a DROP VIEW statement."""
+
+    def __init__(self, view_name: str) -> None:
+        self.view_name = view_name
+
+
 class AlterTable(DDLElement):
     """Represent an ALTER TABLE statement.
 
@@ -185,6 +205,21 @@ class ColumnComment(AlterColumn):
     ) -> None:
         super().__init__(name, column_name, **kw)
         self.comment = comment
+
+
+@compiles(CreateView)
+def visit_create_view(
+    element: CreateView, compiler: DDLCompiler, **kw
+) -> str:
+    return "CREATE VIEW %s AS %s" % (
+        compiler.preparer.quote(element.view_name),
+        element.selectable,
+    )
+
+
+@compiles(DropView)
+def visit_drop_view(element: DropView, compiler: DDLCompiler, **kw) -> str:
+    return "DROP VIEW %s" % (compiler.preparer.quote(element.view_name),)
 
 
 @compiles(RenameTable)

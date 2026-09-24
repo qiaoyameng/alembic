@@ -37,6 +37,9 @@ if TYPE_CHECKING:
     from ..ddl import DefaultImpl
     from ..operations.ops import MigrationScript
     from ..script.base import ScriptDirectory
+    from ..views import ManagedViews
+    from ..views import RemovedView
+    from ..views import ViewDefinition
 
 _RevNumber = Optional[Union[str, tuple[str, ...]]]
 
@@ -51,6 +54,7 @@ RenderItemFn = Callable[
 NameFilterType = Literal[
     "schema",
     "table",
+    "view",
     "column",
     "index",
     "unique_constraint",
@@ -423,6 +427,9 @@ class EnvironmentContext(util.ModuleClsProxy):
         template_args: dict[str, Any] | None = None,
         render_as_batch: bool = False,
         target_metadata: MetaData | Sequence[MetaData] | None = None,
+        managed_views: (
+            Sequence[ViewDefinition | RemovedView] | ManagedViews | None
+        ) = None,
         include_name: IncludeNameFn | None = None,
         include_object: IncludeObjectFn | None = None,
         include_schemas: bool = False,
@@ -562,10 +569,30 @@ class EnvironmentContext(util.ModuleClsProxy):
          object, or a sequence of :class:`~sqlalchemy.schema.MetaData`
          objects, that will be consulted during autogeneration.
          The tables present in each :class:`~sqlalchemy.schema.MetaData`
-         will be compared against
-         what is locally available on the target
-         :class:`~sqlalchemy.engine.Connection`
-         to produce candidate upgrade/downgrade operations.
+        will be compared against
+        what is locally available on the target
+        :class:`~sqlalchemy.engine.Connection`
+        to produce candidate upgrade/downgrade operations.
+        :param managed_views: an optional sequence of
+         :class:`.ViewDefinition` and/or :class:`.RemovedView` objects
+         declaring the plain SQL views that Alembic should manage during
+         autogeneration.  Views that exist in the database but are not
+         declared here are never dropped.  New, changed, and explicitly
+         removed views produce reversible
+         :meth:`.Operations.create_view` / :meth:`.Operations.drop_view`
+         operations, ordered so that dependent views are dropped before
+         the views they depend on and recreated in the opposite
+         direction.  To remove a view that was previously managed,
+         declare it as :class:`.RemovedView`.  This first version of view
+         support targets plain views (e.g. SQLite); materialized views
+         and routines are not supported.
+
+         .. seealso::
+
+            :class:`.ViewDefinition`
+
+            :class:`.RemovedView`
+
         :param compare_type: Indicates type comparison behavior during
          an autogenerate
          operation.  Defaults to ``True`` turning on type comparison, which
@@ -911,6 +938,7 @@ class EnvironmentContext(util.ModuleClsProxy):
             opts["template_args"].update(template_args)
         opts["transaction_per_migration"] = transaction_per_migration
         opts["target_metadata"] = target_metadata
+        opts["managed_views"] = managed_views
         opts["include_name"] = include_name
         opts["include_object"] = include_object
         opts["include_schemas"] = include_schemas

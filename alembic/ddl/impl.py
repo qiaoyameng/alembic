@@ -28,6 +28,7 @@ from ._autogen import _constraint_sig as _constraint_sig
 from ._autogen import ComparisonResult as ComparisonResult
 from .. import util
 from ..util import sqla_compat
+from ..views import normalize_view_select
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -458,6 +459,14 @@ class DefaultImpl(metaclass=ImplMeta):
         table.dispatch.after_drop(
             table, self.connection, checkfirst=False, _ddl_runner=self
         )
+
+    def create_view(self, view_name: str, selectable: str) -> None:
+        self._exec(
+            base.CreateView(view_name, normalize_view_select(selectable))
+        )
+
+    def drop_view(self, view_name: str) -> None:
+        self._exec(base.DropView(view_name))
 
     def create_index(self, index: Index, **kw: Any) -> None:
         self._exec(schema.CreateIndex(index, **kw))

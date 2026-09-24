@@ -277,6 +277,75 @@ CHECK constraints are explicitly named, ideally via a naming convention (see
 :doc:`naming`).   As always, the candidate migrations that autogenerate
 produces must be reviewed by hand.
 
+.. _autogenerate_views:
+
+Managing Views
+--------------
+
+Alembic provides a first version of plain SQL view support, oriented
+towards backends such as SQLite.  Views are managed by declaring them
+explicitly using the
+:paramref:`.EnvironmentContext.configure.managed_views` parameter of
+:meth:`.EnvironmentContext.configure`, as a collection of
+:class:`.ViewDefinition` objects::
+
+    from alembic.views import ViewDefinition
+
+    context.configure(
+        # ...
+        target_metadata=target_metadata,
+        managed_views=[
+            ViewDefinition("v_base", "SELECT id, data FROM base_table"),
+            ViewDefinition(
+                "v_summary",
+                "SELECT id, upper(data) AS data FROM v_base",
+                depends_on=["v_base"],
+            ),
+        ],
+    )
+
+Each definition states the view name, the SQL ``SELECT`` statement as a
+plain string, and the names of any other *managed* views it selects from.
+Dependencies must be declared explicitly; Alembic does not parse the SQL
+body to infer them.  Tables and unmanaged views referenced by the SELECT
+are external dependencies and do not need to be declared.  Dependencies
+that refer to views missing from the collection, as well as dependency
+cycles, raise an error before any SQL is executed.
+
+Autogenerate then compares only the declared views against the database:
+
+* New views are created in dependency order.
+* Changed views are dropped and recreated.  When a view that other managed
+  views depend on changes, the dependent views are dropped first in
+  dependency order and recreated in the opposite direction.
+* Views present in the database but **not declared** are left untouched
+  and are never dropped.
+
+To remove a view that was previously managed, declare it as
+:class:`.RemovedView` in place of its former definition::
+
+    managed_views=[
+        ViewDefinition("v_base", "SELECT id, data FROM base_table"),
+        RemovedView("v_summary"),
+    ]
+
+Simply omitting a view from the collection makes it unmanaged, which
+preserves it; removal must be declared explicitly.  All generated
+operations are reversible: downgrades recreate dropped views using the
+SELECT statement read from the database at autogenerate time, and the
+rendered migration scripts contain only plain strings, with no reference
+to the declared collection.
+
+When comparing definitions, only a leading ``CREATE VIEW ... AS`` wrapper
+and trailing semicolons or whitespace are discarded; the statement text
+itself is compared verbatim, so formatting changes inside the SELECT are
+intentionally detected as changes.
+
+Materialized views, routines, and automatic dependency discovery from
+arbitrary SQL are not supported.  For more sophisticated view support on
+PostgreSQL, see the third-party
+`alembic-utils <https://github.com/olirice/alembic_utils>`_ library.
+
 Notable 3rd-party libraries that extend the built-in Alembic autogenerate functionality
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

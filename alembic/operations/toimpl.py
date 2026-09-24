@@ -128,6 +128,20 @@ def drop_index(operations: "Operations", operation: "ops.DropIndexOp") -> None:
     )
 
 
+@Operations.implementation_for(ops.CreateViewOp)
+def create_view(
+    operations: "Operations", operation: "ops.CreateViewOp"
+) -> None:
+    operations.impl.create_view(operation.view_name, operation.selectable)
+
+
+@Operations.implementation_for(ops.DropViewOp)
+def drop_view(
+    operations: "Operations", operation: "ops.DropViewOp"
+) -> None:
+    operations.impl.drop_view(operation.view_name)
+
+
 @Operations.implementation_for(ops.CreateTableOp)
 def create_table(
     operations: "Operations", operation: "ops.CreateTableOp"

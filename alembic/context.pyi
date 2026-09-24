@@ -33,6 +33,9 @@ if TYPE_CHECKING:
     from .runtime.migration import MigrationContext
     from .runtime.migration import MigrationInfo
     from .script import ScriptDirectory
+    from .views import ManagedViews
+    from .views import RemovedView
+    from .views import ViewDefinition
 
 ### end imports ###
 
@@ -97,6 +100,9 @@ def configure(
     template_args: dict[str, Any] | None = None,
     render_as_batch: bool = False,
     target_metadata: MetaData | Sequence[MetaData] | None = None,
+    managed_views: (
+        Sequence[ViewDefinition | RemovedView] | ManagedViews | None
+    ) = None,
     include_name: (
         Callable[
             [
@@ -104,6 +110,7 @@ def configure(
                 Literal[
                     "schema",
                     "table",
+                    "view",
                     "column",
                     "index",
                     "unique_constraint",
@@ -331,6 +338,17 @@ def configure(
      what is locally available on the target
      :class:`~sqlalchemy.engine.Connection`
      to produce candidate upgrade/downgrade operations.
+    :param managed_views: an optional sequence of
+     :class:`.ViewDefinition` and/or :class:`.RemovedView` objects
+     declaring the plain SQL views that Alembic should manage during
+     autogeneration.  Views that exist in the database but are not
+     declared here are never dropped.  To remove a view that was
+     previously managed, declare it as :class:`.RemovedView`.
+
+     .. seealso::
+
+        :ref:`autogenerate_views`
+
     :param compare_type: Indicates type comparison behavior during
      an autogenerate
      operation.  Defaults to ``True`` turning on type comparison, which

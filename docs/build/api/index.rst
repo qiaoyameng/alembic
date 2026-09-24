@@ -28,7 +28,7 @@ to run commands programmatically, as discussed in the section :doc:`/api/command
    operations
    autogenerate
    script
+   views
    ddl
    plugins
    exceptions
-

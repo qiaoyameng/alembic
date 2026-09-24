@@ -313,6 +313,33 @@ def _render_dialect_kwargs_items(
     ]
 
 
+@renderers.dispatch_for(ops.CreateViewOp)
+def _create_view(
+    autogen_context: AutogenContext, op: ops.CreateViewOp
+) -> str:
+    text = "%(prefix)screate_view(%(name)r, %(selectable)r" % {
+        "prefix": _alembic_autogenerate_prefix(autogen_context),
+        "name": _ident(op.view_name),
+        "selectable": op.selectable,
+    }
+    if op.depends_on:
+        text += ", depends_on=%r" % (list(op.depends_on),)
+    return text + ")"
+
+
+@renderers.dispatch_for(ops.DropViewOp)
+def _drop_view(autogen_context: AutogenContext, op: ops.DropViewOp) -> str:
+    text = "%(prefix)sdrop_view(%(name)r" % {
+        "prefix": _alembic_autogenerate_prefix(autogen_context),
+        "name": _ident(op.view_name),
+    }
+    if op.selectable is not None:
+        text += ", selectable=%r" % (op.selectable,)
+    if op.depends_on:
+        text += ", depends_on=%r" % (list(op.depends_on),)
+    return text + ")"
+
+
 @renderers.dispatch_for(ops.CreateIndexOp)
 def _add_index(autogen_context: AutogenContext, op: ops.CreateIndexOp) -> str:
     index = op.to_index()
