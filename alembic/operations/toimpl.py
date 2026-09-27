@@ -144,8 +144,14 @@ def create_table(
 def rename_table(
     operations: "Operations", operation: "ops.RenameTableOp"
 ) -> None:
+    kw = {}
+    if operation.reapply_naming_convention:
+        kw["reapply_naming_convention"] = operation.reapply_naming_convention
     operations.impl.rename_table(
-        operation.table_name, operation.new_table_name, schema=operation.schema
+        operation.table_name,
+        operation.new_table_name,
+        schema=operation.schema,
+        **kw,
     )
 
 

@@ -54,6 +54,13 @@ class OpTest(TestBase):
         op.rename_table("t1", "t2", schema="foo")
         context.assert_("ALTER TABLE foo.t1 RENAME TO foo.t2")
 
+    def test_rename_table_reverse(self):
+        op = ops.RenameTableOp("t1", "t2", schema="foo")
+        reverse = op.reverse()
+        eq_(reverse.table_name, "t2")
+        eq_(reverse.new_table_name, "t1")
+        eq_(reverse.schema, "foo")
+
     def test_create_index_arbitrary_expr(self):
         context = op_fixture()
         op.create_index("name", "tname", [func.foo(column("x"))])

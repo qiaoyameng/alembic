@@ -66,7 +66,7 @@ class SQLiteImpl(DefaultImpl):
                     and col.server_default.persisted
                 ):
                     return True
-            elif op[0] not in ("create_index", "drop_index"):
+            elif op[0] not in ("create_index", "drop_index", "rename_table"):
                 return True
         else:
             return False

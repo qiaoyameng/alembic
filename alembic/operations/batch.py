@@ -3,31 +3,37 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from typing import TYPE_CHECKING
 
 from sqlalchemy import CheckConstraint
 from sqlalchemy import Column
+from sqlalchemy import exc as sa_exc
 from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy import Index
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import MetaData
 from sqlalchemy import PrimaryKeyConstraint
 from sqlalchemy import schema as sql_schema
 from sqlalchemy import select
 from sqlalchemy import Table
 from sqlalchemy import types as sqltypes
+from sqlalchemy.sql.elements import conv
 from sqlalchemy.sql.schema import SchemaEventTarget
 from sqlalchemy.util import OrderedDict
 from sqlalchemy.util import topological
 
 from .. import util
 from ..util import exc
+from ..util.sqla_compat import _constraint_name_for_table
 from ..util.sqla_compat import _columns_for_constraint
 from ..util.sqla_compat import _conv_constraint_names
 from ..util.sqla_compat import _copy
 from ..util.sqla_compat import _copy_expression
 from ..util.sqla_compat import _ensure_scope_for_ddl
 from ..util.sqla_compat import _fk_is_self_referential
+from ..util.sqla_compat import _fk_target_table_key
 from ..util.sqla_compat import _fk_target_tokens
 from ..util.sqla_compat import _get_table_key
 from ..util.sqla_compat import _idx_table_bound_expressions
@@ -88,6 +94,7 @@ class BatchOperationsImpl:
         self.naming_convention = naming_convention
         self.partial_reordering = partial_reordering
         self.batch = []
+        self._renamed_to: str | None = None
 
     @property
     def dialect(self) -> Dialect:
@@ -105,15 +112,74 @@ class BatchOperationsImpl:
         else:
             return False
 
+    def _check_rename_table(self, should_recreate: bool) -> None:
+        """Validate a pending rename against the live database before any
+        table-altering DDL has been emitted.
+
+        Offline (``--sql``) mode can't inspect a database, so these checks
+        are skipped there; the emitted SQL is validated by the database
+        when it runs.
+
+        """
+        assert self._renamed_to is not None
+        if self.operations.migration_context.as_sql:
+            return
+
+        bind = self.operations.get_bind()
+        inspector = sa_inspect(bind)
+        if self._renamed_to in inspector.get_table_names(schema=self.schema):
+            raise exc.CommandError(
+                f"Can't rename table '{self.table_name}' to "
+                f"'{self._renamed_to}'; the target table already exists. "
+                "Drop or rename the existing table first, or choose a "
+                "different target name."
+            )
+
+        if should_recreate and self.impl.dialect.name == "sqlite":
+            fk_enabled = bind.exec_driver_sql("PRAGMA foreign_keys").scalar()
+            if fk_enabled:
+                raise exc.CommandError(
+                    f"Renaming table '{self.table_name}' within a batch "
+                    "table recreate requires SQLite's foreign key "
+                    "enforcement to be disabled, as the original table "
+                    "must be dropped while other tables may still refer "
+                    "to it.  Disable enforcement before running the "
+                    "migration, e.g. issue 'PRAGMA foreign_keys=OFF' on "
+                    "the connection (outside of a transaction), or run "
+                    "the migration with foreign key enforcement off."
+                )
+
     def flush(self) -> None:
         should_recreate = self._should_recreate()
 
         with _ensure_scope_for_ddl(self.impl.connection):
             if not should_recreate:
+                if self._renamed_to is not None:
+                    self._check_rename_table(should_recreate)
                 for opname, arg, kw in self.batch:
+                    if opname == "rename_table":
+                        # the rename is applied after all other operations
+                        # so that those operations may continue to refer
+                        # to the table by its original name regardless of
+                        # the order in which they were invoked.
+                        continue
                     fn = getattr(self.operations.impl, opname)
                     fn(*arg, **kw)
+                for opname, arg, kw in self.batch:
+                    if opname != "rename_table":
+                        continue
+                    kw = dict(kw)
+                    if kw.pop("reapply_naming_convention", False):
+                        util.warn(
+                            "The reapply_naming_convention parameter of "
+                            "batch rename_table() has no effect when the "
+                            "table is not recreated; constraint and index "
+                            "names are left as-is by ALTER TABLE RENAME."
+                        )
+                    self.operations.impl.rename_table(*arg, **kw)
             else:
+                if self._renamed_to is not None:
+                    self._check_rename_table(should_recreate)
                 m1 = MetaData()
 
                 if self.copy_from is not None:
@@ -194,8 +260,37 @@ class BatchOperationsImpl:
     def drop_constraint(self, const: Constraint) -> None:
         self.batch.append(("drop_constraint", (const,), {}))
 
-    def rename_table(self, *arg, **kw):
-        self.batch.append(("rename_table", arg, kw))
+    def rename_table(
+        self,
+        table_name: str,
+        new_table_name: str,
+        schema: str | None = None,
+        reapply_naming_convention: bool = False,
+    ) -> None:
+        if self._renamed_to is not None:
+            raise exc.CommandError(
+                f"Table '{self.table_name}' is already being renamed to "
+                f"'{self._renamed_to}' in this batch; only one "
+                "rename_table() operation may be issued per "
+                "batch_alter_table() block."
+            )
+        if new_table_name == self.table_name:
+            raise exc.CommandError(
+                f"Can't rename table '{self.table_name}' to itself; "
+                "the new table name must be different from the current "
+                "name."
+            )
+        self._renamed_to = new_table_name
+        self.batch.append(
+            (
+                "rename_table",
+                (table_name, new_table_name),
+                {
+                    "schema": schema,
+                    "reapply_naming_convention": reapply_naming_convention,
+                },
+            )
+        )
 
     def create_index(self, idx: Index, **kw: Any) -> None:
         self.batch.append(("create_index", (idx,), kw))
@@ -241,6 +336,9 @@ class ApplyBatchImpl:
             tuple[str, str], ...
         ] = ()  # tuple of tuples
 
+        self.renamed_to: str | None = None
+        self.reapply_naming_convention: bool = False
+
         self.column_transfers = OrderedDict(
             (c.name, {"expr": c}) for c in self.table.c
         )
@@ -269,6 +367,16 @@ class ApplyBatchImpl:
         self.col_named_constraints = {}
         self.indexes: dict[str, Index] = {}
         self.new_indexes: dict[str, Index] = {}
+
+        # names of constraints / indexes that are known to have been
+        # generated by a naming convention, as indicated by the
+        # :class:`sqlalchemy.schema.conv` marker that SQLAlchemy applies
+        # when it renders the name.  Names that come back from reflection
+        # have lost this information, as they are all marked with ``conv``
+        # to indicate they are final; those names are therefore not
+        # recorded here and are never treated as convention-generated.
+        self.convention_generated_constraints: set[str] = set()
+        self.convention_generated_indexes: set[str] = set()
 
         # a reflected CHECK constraint that has no name can't be linked
         # to the column or datatype it applies to, so it is omitted from
@@ -304,6 +412,8 @@ class ApplyBatchImpl:
                     )
             elif constraint_name_string(const.name):
                 self.named_constraints[const.name] = const
+                if not self.reflected and isinstance(const.name, conv):
+                    self.convention_generated_constraints.add(const.name)
             else:
                 self.unnamed_constraints.append(const)
 
@@ -315,6 +425,8 @@ class ApplyBatchImpl:
 
         for idx in self.table.indexes:
             self.indexes[idx.name] = idx  # type: ignore[index]
+            if not self.reflected and isinstance(idx.name, conv):
+                self.convention_generated_indexes.add(idx.name)
 
         for k in self.table.kwargs:
             self.table_kwargs.setdefault(k, self.table.kwargs[k])
@@ -354,6 +466,7 @@ class ApplyBatchImpl:
 
         m = MetaData()
         schema = self.table.schema
+        naming_context = self._final_naming_context()
 
         if self.partial_reordering or self.add_col_ordering:
             self._adjust_self_columns_for_partial_reordering()
@@ -370,7 +483,13 @@ class ApplyBatchImpl:
         # such as Boolean or Enum are named using the naming convention of
         # the table being replaced; the new table is under a temporary name
         # at this point so it can't supply the convention itself.
-        _name_type_bound_constraints(new_table, self.table)
+        # when the table is being renamed and convention-generated names
+        # are to be reapplied, the convention is instead resolved against
+        # the final table name.
+        _name_type_bound_constraints(
+            new_table,
+            naming_context if naming_context is not None else self.table,
+        )
 
         for const in (
             list(self.named_constraints.values()) + self.unnamed_constraints
@@ -383,15 +502,26 @@ class ApplyBatchImpl:
             const_copy: Constraint
             if isinstance(const, ForeignKeyConstraint):
                 if _fk_is_self_referential(const):
-                    # for self-referential constraint, refer to the
-                    # *original* table name, and not _alembic_batch_temp.
-                    # This is consistent with how we're handling
-                    # FK constraints from other tables; we assume SQLite
-                    # no foreign keys just keeps the names unchanged, so
-                    # when we rename back, they match again.
-                    const_copy = _copy(
-                        const, schema=schema, target_table=self.table
-                    )
+                    if self.renamed_to is not None:
+                        # self-referential constraint on a table that's
+                        # being renamed: refer to the *final* table name,
+                        # which is the name the new table will have once
+                        # the recreate is complete.
+                        const_copy = _copy(
+                            const,
+                            schema=schema,
+                            target_table=self._self_ref_referent(m),
+                        )
+                    else:
+                        # for self-referential constraint, refer to the
+                        # *original* table name, and not _alembic_batch_temp.
+                        # This is consistent with how we're handling
+                        # FK constraints from other tables; we assume SQLite
+                        # no foreign keys just keeps the names unchanged, so
+                        # when we rename back, they match again.
+                        const_copy = _copy(
+                            const, schema=schema, target_table=self.table
+                        )
                 else:
                     # "target_table" for ForeignKeyConstraint.copy() is
                     # only used if the FK is detected as being
@@ -403,11 +533,34 @@ class ApplyBatchImpl:
                 )
             if isinstance(const, ForeignKeyConstraint):
                 self._setup_referent(m, const)
+            if (
+                naming_context is not None
+                and const_copy.name in self.convention_generated_constraints
+            ):
+                new_const_name = self._reapply_convention_to_name(
+                    const_copy, naming_context
+                )
+                if new_const_name is not None:
+                    const_copy.name = conv(new_const_name)
             new_table.append_constraint(const_copy)
+
+    def _self_ref_referent(self, metadata: MetaData) -> Table:
+        """Return a stand-in table within ``metadata`` that carries the
+        final table name, to be used as the referent of self-referential
+        foreign keys when the table is being renamed.
+
+        """
+        assert self.renamed_to is not None
+        key = _get_table_key(self.renamed_to, self.table.schema)
+        try:
+            return metadata.tables[key]
+        except KeyError:
+            return Table(self.renamed_to, metadata, schema=self.table.schema)
 
     def _gather_indexes_from_both_tables(self) -> list[Index]:
         assert self.new_table is not None
         idx: list[Index] = []
+        naming_context = self._final_naming_context()
 
         for idx_existing in self.indexes.values():
             # this is a lift-and-move from Table.to_metadata
@@ -415,8 +568,19 @@ class ApplyBatchImpl:
             if idx_existing._column_flag:
                 continue
 
+            idx_name = idx_existing.name
+            if (
+                naming_context is not None
+                and idx_name in self.convention_generated_indexes
+            ):
+                new_idx_name = self._reapply_convention_to_name(
+                    idx_existing, naming_context
+                )
+                if new_idx_name is not None:
+                    idx_name = conv(new_idx_name)
+
             idx_copy = Index(
-                idx_existing.name,
+                idx_name,
                 unique=idx_existing.unique,
                 *[
                     _copy_expression(expr, self.new_table)
@@ -442,6 +606,14 @@ class ApplyBatchImpl:
         self, metadata: MetaData, constraint: ForeignKeyConstraint
     ) -> None:
         referent_schema, tname, _ = _fk_target_tokens(constraint.elements[0])
+
+        if (
+            self.renamed_to is not None
+            and _fk_target_table_key(constraint.elements[0]) == self.table.key
+        ):
+            # a self-referential foreign key on a table that's being
+            # renamed refers to the final table name
+            tname = self.renamed_to
 
         if tname != self.temp_table_name:
             key = _get_table_key(tname, referent_schema)
@@ -474,6 +646,8 @@ class ApplyBatchImpl:
         assert self.new_table is not None
         op_impl.create_table(self.new_table)
 
+        final_table_name = self._final_table_name
+
         try:
             op_impl._exec(
                 self.new_table.insert()
@@ -493,15 +667,36 @@ class ApplyBatchImpl:
                     ),
                 )
             )
-            op_impl.drop_table(self.table)
+            if self.renamed_to is not None:
+                # rename the original table to its final name before
+                # dropping it.  On backends such as SQLite that rewrite
+                # referring foreign keys in other tables across a rename,
+                # this updates those references to the final table name;
+                # the reference is then satisfied again once the new
+                # table itself is renamed below.
+                op_impl.rename_table(
+                    self.table.name,
+                    self.renamed_to,
+                    schema=self.table.schema,
+                )
+                original_name = self.table.name
+                self.table.name = self.renamed_to
+                try:
+                    op_impl.drop_table(self.table)
+                finally:
+                    self.table.name = original_name
+            else:
+                op_impl.drop_table(self.table)
         except:
             op_impl.drop_table(self.new_table)
             raise
         else:
             op_impl.rename_table(
-                self.temp_table_name, self.table.name, schema=self.table.schema
+                self.temp_table_name,
+                final_table_name,
+                schema=self.table.schema,
             )
-            self.new_table.name = self.table.name
+            self.new_table.name = final_table_name
             try:
                 for idx in self._gather_indexes_from_both_tables():
                     op_impl.create_index(idx)
@@ -754,5 +949,135 @@ class ApplyBatchImpl:
         except KeyError:
             raise ValueError("No such index: '%s'" % idx.name)
 
-    def rename_table(self, *arg, **kw):
-        raise NotImplementedError("TODO")
+    def rename_table(
+        self,
+        table_name: str,
+        new_table_name: str,
+        schema: str | None = None,
+        reapply_naming_convention: bool = False,
+    ) -> None:
+        if self.renamed_to is not None:
+            raise exc.CommandError(
+                f"Table '{self.table.name}' is already being renamed to "
+                f"'{self.renamed_to}' in this batch; only one "
+                "rename_table() operation may be issued per "
+                "batch_alter_table() block."
+            )
+        self.renamed_to = new_table_name
+        self.reapply_naming_convention = reapply_naming_convention
+
+        if reapply_naming_convention and self.reflected:
+            reflected_names = sorted(
+                list(self.named_constraints) + list(self.indexes)
+            )
+            if reflected_names:
+                util.warn(
+                    f"Cannot determine which constraint/index names on "
+                    f"reflected table '{self.table.name}' were generated "
+                    "by a naming convention, as reflection does not "
+                    "provide this information; existing names "
+                    f"({', '.join(reflected_names)}) are preserved "
+                    "as-is.  To have convention-generated names "
+                    "regenerated against the new table name, pass a "
+                    "Table object to batch_alter_table()'s copy_from "
+                    "parameter that is defined against a MetaData that "
+                    "includes the naming_convention, so that generated "
+                    "names can be identified."
+                )
+
+    @property
+    def _final_table_name(self) -> str:
+        return (
+            self.renamed_to if self.renamed_to is not None else self.table.name
+        )
+
+    def _final_naming_context(self) -> Table | None:
+        """Return a throwaway :class:`.Table` carrying the final table
+        name and the source table's naming convention, against which
+        convention-generated constraint and index names may be
+        re-rendered.  Returns ``None`` if no rename with
+        ``reapply_naming_convention`` is pending or no naming convention
+        is in use.
+
+        """
+        if self.renamed_to is None or not self.reapply_naming_convention:
+            return None
+        naming_convention = self.table.metadata.naming_convention
+        if not naming_convention:
+            return None
+        return Table(
+            self.renamed_to,
+            MetaData(naming_convention=naming_convention),
+            schema=self.table.schema,
+        )
+
+    def _reapply_convention_to_name(
+        self, const: Constraint | Index, naming_context: Table
+    ) -> str | None:
+        """Re-render the naming-convention-generated name of ``const``
+        against ``naming_context``.
+
+        Returns the re-rendered name, or ``None`` if the convention
+        can't be resolved, in which case the existing name should be
+        preserved.  ``const`` itself is not modified.
+
+        """
+        existing_name = const.name
+        try:
+            const.name = None
+            try:
+                new_name = _constraint_name_for_table(const, naming_context)
+            except sa_exc.InvalidRequestError:
+                new_name = self._reapply_convention_w_constraint_name(
+                    const, naming_context, existing_name
+                )
+        finally:
+            const.name = existing_name
+
+        if not new_name:
+            util.warn(
+                f"Can't regenerate the naming-convention-generated name "
+                f"'{existing_name}' against the new table name "
+                f"'{self.renamed_to}'; the existing name is preserved."
+            )
+            return None
+        return str(new_name)
+
+    #: placeholder substituted for the ``%(constraint_name)s`` token when
+    #: recovering the pre-convention name of a constraint
+    _CONSTRAINT_NAME_SENTINEL = "\x00alembic_constraint_name\x00"
+
+    def _reapply_convention_w_constraint_name(
+        self,
+        const: Constraint | Index,
+        naming_context: Table,
+        existing_name: str,
+    ) -> str | None:
+        """Re-render a convention-generated name where the convention
+        includes the ``%(constraint_name)s`` token.
+
+        The token refers to the name the constraint had before the
+        convention was applied, which is no longer present on the
+        constraint.  It's recovered by rendering the convention against
+        the original table with a sentinel in place of the token and
+        matching the existing generated name against the result; all
+        other tokens render identically for the original and the new
+        table name.
+
+        """
+        const.name = self._CONSTRAINT_NAME_SENTINEL
+        old_render = _constraint_name_for_table(const, self.table)
+        if not old_render:
+            return None
+        pattern = re.escape(str(old_render)).replace(
+            re.escape(self._CONSTRAINT_NAME_SENTINEL), "(.+)"
+        )
+        match = re.fullmatch(pattern, str(existing_name))
+        if match is None:
+            # the existing name was not produced by this convention
+            # against the original table name, e.g. the table was
+            # renamed previously; don't guess at a new name.
+            return None
+        const.name = match.group(1)
+        new_name = _constraint_name_for_table(const, naming_context)
+        return str(new_name) if new_name else None

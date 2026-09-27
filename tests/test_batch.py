@@ -1148,6 +1148,51 @@ class BatchAPITest(TestBase):
             [mock.call.drop_constraint(self.mock_schema.Constraint())],
         )
 
+    def test_rename_table(self):
+        with self._fixture() as batch:
+            batch.rename_table("newname")
+
+        eq_(
+            batch.impl.operations.impl.mock_calls,
+            [mock.call.rename_table("tname", "newname", schema=None)],
+        )
+
+    def test_rename_table_applied_last(self):
+        # regardless of invocation order, the rename is emitted after
+        # all other operations so that they may refer to the table by
+        # its original name
+        with self._fixture() as batch:
+            batch.rename_table("newname")
+            batch.drop_column("q")
+
+        eq_(
+            batch.impl.operations.impl.mock_calls,
+            [
+                mock.call.drop_column(
+                    "tname",
+                    self.mock_schema.Column(),
+                    schema=None,
+                    if_exists=None,
+                ),
+                mock.call.rename_table("tname", "newname", schema=None),
+            ],
+        )
+
+    def test_rename_table_multiple_rejected(self):
+        with self._fixture() as batch:
+            batch.rename_table("n1")
+            with expect_raises_message(
+                CommandError, r"only one rename_table\(\) operation"
+            ):
+                batch.rename_table("n2")
+
+    def test_rename_table_to_same_name_rejected(self):
+        with self._fixture() as batch:
+            with expect_raises_message(
+                CommandError, "Can't rename table 'tname' to itself"
+            ):
+                batch.rename_table("tname")
+
 
 class CopyFromTest(TestBase):
     def _fixture(self):
@@ -2900,7 +2945,578 @@ class BatchUnnamedCheckConstraintTest(_BatchRoundTripBase, TestBase):
         eq_(self._check_constraints(connection), [(None, "x > 5")])
 
 
+class BatchRenameTableTest(_BatchRoundTripBase, TestBase):
+    """test batch_op.rename_table() against a live SQLite database."""
+
+    __only_on__ = "sqlite"
+
+    @testing.fixture(autouse=True)
+    def _reflect_for_teardown_fixture(self, metadata, connection):
+        yield
+        metadata.reflect(connection)
+
+    @testing.fixture
+    def sqlite_referential_integrity(self, connection, metadata):
+        """turn on SQLite referential integrity for a single test."""
+
+        if not exclusions.against(config._current, "sqlite"):
+            config.skip_test("SQLite PRAGMA foreign_keys only")
+
+        # the PRAGMA autobegins; end that transaction so that the test
+        # can call connection.begin()
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        _safe_commit_connection_transaction(connection)
+        try:
+            yield
+        finally:
+            _safe_rollback_connection_transaction(connection)
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            _safe_commit_connection_transaction(connection)
+
+            metadata.reflect(connection)
+
+    @testing.fixture
+    def emp_fixture(self, metadata, connection):
+        with connection.begin():
+            emp = Table(
+                "emp",
+                metadata,
+                Column("id", Integer, primary_key=True),
+                Column("name", String(30), nullable=False),
+                Column("nickname", String(30)),
+                Column("mgr_id", Integer, ForeignKey("emp.id")),
+                Column("age", Integer),
+                UniqueConstraint("name", name="uq_emp_name"),
+                CheckConstraint("age > 0", name="ck_emp_age"),
+                Index("ix_emp_age", "age"),
+            )
+            dept = Table(
+                "dept",
+                metadata,
+                Column("id", Integer, primary_key=True),
+                Column("head_emp_id", Integer, ForeignKey("emp.id")),
+            )
+            metadata.create_all(connection)
+            connection.execute(
+                emp.insert(),
+                [
+                    {
+                        "id": 1,
+                        "name": "emp1",
+                        "mgr_id": None,
+                        "age": 30,
+                        "nickname": "e1",
+                    },
+                    {
+                        "id": 2,
+                        "name": "emp2",
+                        "mgr_id": 1,
+                        "age": 40,
+                        "nickname": "e2",
+                    },
+                ],
+            )
+            connection.execute(dept.insert(), [{"id": 1, "head_emp_id": 2}])
+        return emp, dept
+
+    def _table_names(self, connection):
+        return sorted(inspect(connection).get_table_names())
+
+    def _assert_employee_table(self, connection):
+        """the renamed 'emp' table is present as 'employee' with all of
+        its data, constraints and indexes, and no temporary tables or
+        stale references to the old name remain."""
+        insp = inspect(connection)
+        eq_(self._table_names(connection), ["dept", "employee"])
+
+        eq_(
+            {c["name"] for c in insp.get_columns("employee")},
+            {"id", "name", "mgr_id", "age", "nickname"},
+        )
+        eq_(
+            insp.get_unique_constraints("employee"),
+            [{"name": "uq_emp_name", "column_names": ["name"]}],
+        )
+        eq_(
+            [
+                (c["name"], c["sqltext"])
+                for c in insp.get_check_constraints("employee")
+            ],
+            [("ck_emp_age", "age > 0")],
+        )
+        eq_(insp.get_pk_constraint("employee")["constrained_columns"], ["id"])
+        eq_(
+            [
+                (i["name"], i["column_names"])
+                for i in insp.get_indexes("employee")
+            ],
+            [("ix_emp_age", ["age"])],
+        )
+
+        # self-referential foreign key points at the new table
+        eq_(
+            [
+                (fk["referred_table"], fk["referred_columns"])
+                for fk in insp.get_foreign_keys("employee")
+            ],
+            [("employee", ["id"])],
+        )
+        # the foreign key from the other table points at the new table
+        eq_(
+            [
+                (fk["referred_table"], fk["referred_columns"])
+                for fk in insp.get_foreign_keys("dept")
+            ],
+            [("employee", ["id"])],
+        )
+
+        eq_(
+            connection.exec_driver_sql(
+                "SELECT id, name, mgr_id, age, nickname FROM employee "
+                "ORDER BY id"
+            ).fetchall(),
+            [(1, "emp1", None, 30, "e1"), (2, "emp2", 1, 40, "e2")],
+        )
+        eq_(
+            connection.exec_driver_sql(
+                "SELECT id, head_emp_id FROM dept"
+            ).fetchall(),
+            [(1, 2)],
+        )
+
+        # no temporary tables or references to the old name remain
+        # anywhere in the schema
+        for (sql,) in connection.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"
+        ):
+            assert "_alembic_tmp" not in sql, sql
+            assert not re.search(r"\bemp\b(?!loyee)", sql), sql
+
+        # referential integrity holds for the migrated data
+        eq_(
+            connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall(),
+            [],
+        )
+
+    def test_rename_recreate(self, emp_fixture, connection):
+        with self.op.batch_alter_table("emp", recreate="always") as batch_op:
+            batch_op.rename_table("employee")
+
+        self._assert_employee_table(connection)
+
+    def test_rename_no_recreate(self, emp_fixture, connection):
+        # a rename on its own doesn't require a table recreate; a plain
+        # ALTER TABLE ... RENAME TO ... is emitted
+        with self.op.batch_alter_table("emp") as batch_op:
+            batch_op.rename_table("employee")
+
+        self._assert_employee_table(connection)
+
+    def test_rename_w_column_ops(self, emp_fixture, connection):
+        # rename is invoked first; the final result is the same as if
+        # it had been invoked last
+        with self.op.batch_alter_table("emp") as batch_op:
+            batch_op.rename_table("employee")
+            batch_op.add_column(Column("email", String(50)))
+            batch_op.drop_column("nickname")
+            batch_op.alter_column("name", new_column_name="emp_name")
+            batch_op.create_index("ix_email", ["email"])
+
+        insp = inspect(connection)
+        eq_(self._table_names(connection), ["dept", "employee"])
+        eq_(
+            [c["name"] for c in insp.get_columns("employee")],
+            ["id", "emp_name", "mgr_id", "age", "email"],
+        )
+        eq_(
+            [
+                (i["name"], i["column_names"])
+                for i in insp.get_indexes("employee")
+            ],
+            [("ix_email", ["email"]), ("ix_emp_age", ["age"])],
+        )
+        eq_(
+            connection.exec_driver_sql(
+                "SELECT id, emp_name, mgr_id, age FROM employee ORDER BY id"
+            ).fetchall(),
+            [(1, "emp1", None, 30), (2, "emp2", 1, 40)],
+        )
+        eq_(
+            [fk["referred_table"] for fk in insp.get_foreign_keys("employee")],
+            ["employee"],
+        )
+        eq_(
+            [fk["referred_table"] for fk in insp.get_foreign_keys("dept")],
+            ["employee"],
+        )
+
+    def test_rename_round_trip(self, emp_fixture, connection):
+        with self.op.batch_alter_table("emp") as batch_op:
+            batch_op.rename_table("employee")
+        self._assert_employee_table(connection)
+
+        # the reverse migration restores the original name
+        with self.op.batch_alter_table("employee") as batch_op:
+            batch_op.rename_table("emp")
+
+        insp = inspect(connection)
+        eq_(self._table_names(connection), ["dept", "emp"])
+        eq_(
+            [fk["referred_table"] for fk in insp.get_foreign_keys("emp")],
+            ["emp"],
+        )
+        eq_(
+            [fk["referred_table"] for fk in insp.get_foreign_keys("dept")],
+            ["emp"],
+        )
+        eq_(
+            connection.exec_driver_sql(
+                "SELECT id, name, mgr_id, age FROM emp ORDER BY id"
+            ).fetchall(),
+            [(1, "emp1", None, 30), (2, "emp2", 1, 40)],
+        )
+
+    def test_rename_target_exists(self, emp_fixture, connection):
+        with expect_raises_message(
+            CommandError,
+            "Can't rename table 'emp' to 'dept'; the target table "
+            "already exists",
+        ):
+            with self.op.batch_alter_table("emp") as batch_op:
+                batch_op.rename_table("dept")
+
+        # the error is raised before any table-altering DDL
+        eq_(self._table_names(connection), ["dept", "emp"])
+        eq_(
+            connection.exec_driver_sql("SELECT COUNT(*) FROM emp").scalar(),
+            2,
+        )
+
+    def test_rename_multiple_rejected(self, emp_fixture, connection):
+        with expect_raises_message(
+            CommandError, r"only one rename_table\(\) operation"
+        ):
+            with self.op.batch_alter_table("emp") as batch_op:
+                batch_op.rename_table("employee")
+                batch_op.rename_table("worker")
+
+        eq_(self._table_names(connection), ["dept", "emp"])
+
+    def test_rename_to_same_name_rejected(self, emp_fixture, connection):
+        with expect_raises_message(
+            CommandError, "Can't rename table 'emp' to itself"
+        ):
+            with self.op.batch_alter_table("emp") as batch_op:
+                batch_op.rename_table("emp")
+
+        eq_(self._table_names(connection), ["dept", "emp"])
+
+    def test_rename_foreign_keys_enabled_rejected(
+        self, emp_fixture, sqlite_referential_integrity, connection
+    ):
+        with expect_raises_message(
+            CommandError,
+            "Renaming table 'emp' within a batch table recreate requires "
+            "SQLite's foreign key enforcement to be disabled",
+        ):
+            with self.op.batch_alter_table("emp", recreate="always") as bop:
+                bop.rename_table("employee")
+
+        # the error is raised before the original table is touched
+        eq_(self._table_names(connection), ["dept", "emp"])
+        eq_(
+            connection.exec_driver_sql("SELECT COUNT(*) FROM emp").scalar(),
+            2,
+        )
+
+    def test_rename_no_recreate_foreign_keys_enabled(
+        self, emp_fixture, sqlite_referential_integrity, connection
+    ):
+        # a rename that doesn't require a table recreate is a plain
+        # ALTER TABLE ... RENAME TO ..., which is safe with foreign key
+        # enforcement enabled; SQLite rewrites referring foreign keys
+        with self.op.batch_alter_table("emp") as batch_op:
+            batch_op.rename_table("employee")
+
+        self._assert_employee_table(connection)
+
+    def test_rename_failed_recreate_recovers(self, metadata, connection):
+        with connection.begin():
+            dup = Table(
+                "dup",
+                metadata,
+                Column("id", Integer, primary_key=True),
+                Column("val", Integer),
+            )
+            dup.create(connection)
+            connection.execute(
+                dup.insert(), [{"id": 1, "val": 1}, {"id": 2, "val": 1}]
+            )
+
+        # the unique constraint can't be created over duplicate data, so
+        # the recreate fails partway through
+        with expect_raises_message(sqla_exc.IntegrityError, "UNIQUE"):
+            with self.op.batch_alter_table("dup") as batch_op:
+                batch_op.create_unique_constraint("uq_val", ["val"])
+                batch_op.rename_table("dup2")
+
+        # the original table is intact under its original name and the
+        # rename did not take place.  the temporary table may be left
+        # behind on pysqlite, where DDL is not transactional; this is
+        # pre-existing batch behavior and is cleaned up by the test
+        # teardown.
+        remaining = self._table_names(connection)
+        assert "dup" in remaining
+        assert "dup2" not in remaining
+        eq_(
+            connection.exec_driver_sql(
+                "SELECT id, val FROM dup ORDER BY id"
+            ).fetchall(),
+            [(1, 1), (2, 1)],
+        )
+
+
+class BatchRenameNamingConventionTest(_BatchRoundTripBase, TestBase):
+    """test the reapply_naming_convention option of batch
+    rename_table()."""
+
+    __only_on__ = "sqlite"
+
+    naming_convention = {
+        "uq": "uq_%(table_name)s_%(column_0_name)s",
+        "ck": "ck_%(table_name)s_%(constraint_name)s",
+        "ix": "ix_%(table_name)s_%(column_0_name)s",
+        "pk": "pk_%(table_name)s",
+    }
+
+    @testing.fixture(autouse=True)
+    def _reflect_for_teardown_fixture(self, metadata, connection):
+        yield
+        metadata.reflect(connection)
+
+    @testing.fixture
+    def conv_table_fixture(self, connection):
+        m = MetaData(naming_convention=self.naming_convention)
+        t = Table(
+            "oldt",
+            m,
+            Column("id", Integer, primary_key=True),
+            Column("name", String(30)),
+            Column("age", Integer),
+            Column(
+                "active",
+                Boolean(create_constraint=True, name="active"),
+                nullable=False,
+                server_default="1",
+            ),
+            # generated by the convention
+            UniqueConstraint("name"),
+            # generated by the convention from the given name
+            CheckConstraint("age > 0", name="positive_age"),
+            # explicit name that only looks convention-generated
+            UniqueConstraint("age", name="uq_oldt_age"),
+            # explicit index name
+            Index("ix_hint", "name"),
+        )
+        with connection.begin():
+            t.create(connection)
+            connection.execute(
+                t.insert(),
+                [{"id": 1, "name": "n1", "age": 5, "active": True}],
+            )
+        return t
+
+    def _constraint_names(self, connection, table="newt"):
+        insp = inspect(connection)
+        return {
+            "uq": sorted(
+                u["name"] for u in insp.get_unique_constraints(table)
+            ),
+            "ck": sorted(c["name"] for c in insp.get_check_constraints(table)),
+            "ix": sorted(i["name"] for i in insp.get_indexes(table)),
+            "pk": insp.get_pk_constraint(table)["name"],
+        }
+
+    def test_reapply_naming_convention(self, conv_table_fixture, connection):
+        t = conv_table_fixture
+        with self.op.batch_alter_table(
+            "oldt", copy_from=t, recreate="always"
+        ) as batch_op:
+            batch_op.rename_table("newt", reapply_naming_convention=True)
+
+        eq_(inspect(connection).get_table_names(), ["newt"])
+        eq_(
+            self._constraint_names(connection),
+            {
+                # convention-generated names are re-rendered against the
+                # new table name
+                "uq": ["uq_newt_name", "uq_oldt_age"],
+                "ck": ["ck_newt_active", "ck_newt_positive_age"],
+                "ix": ["ix_hint"],
+                "pk": "pk_newt",
+            },
+        )
+        eq_(
+            connection.exec_driver_sql(
+                "SELECT id, name, age, active FROM newt"
+            ).fetchall(),
+            [(1, "n1", 5, 1)],
+        )
+
+    def test_names_preserved_by_default(self, conv_table_fixture, connection):
+        t = conv_table_fixture
+        with self.op.batch_alter_table(
+            "oldt", copy_from=t, recreate="always"
+        ) as batch_op:
+            batch_op.rename_table("newt")
+
+        eq_(inspect(connection).get_table_names(), ["newt"])
+        eq_(
+            self._constraint_names(connection),
+            {
+                "uq": ["uq_oldt_age", "uq_oldt_name"],
+                "ck": ["ck_oldt_active", "ck_oldt_positive_age"],
+                "ix": ["ix_hint"],
+                "pk": "pk_oldt",
+            },
+        )
+
+    def test_reapply_reflected_names_warns(
+        self, conv_table_fixture, connection
+    ):
+        # a reflected table carries no information about which names
+        # were generated by a naming convention; the names are preserved
+        # and a warning is emitted
+        with expect_warnings(
+            "Cannot determine which constraint/index names on reflected "
+            "table 'oldt' were generated by a naming convention"
+        ):
+            with self.op.batch_alter_table(
+                "oldt",
+                naming_convention=self.naming_convention,
+                recreate="always",
+            ) as batch_op:
+                batch_op.rename_table("newt", reapply_naming_convention=True)
+
+        eq_(inspect(connection).get_table_names(), ["newt"])
+        eq_(
+            self._constraint_names(connection),
+            {
+                "uq": ["uq_oldt_age", "uq_oldt_name"],
+                "ck": ["ck_oldt_active", "ck_oldt_positive_age"],
+                "ix": ["ix_hint"],
+                "pk": "pk_oldt",
+            },
+        )
+
+
 class OfflineTest(TestBase):
+    @testing.fixture
+    def rename_batch_fixture(self):
+        staging_env()
+
+        def go():
+            self.cfg = cfg = _no_sql_testing_config(dialect="sqlite")
+
+            self.a = a = util.rev_id()
+
+            script = ScriptDirectory.from_config(cfg)
+            script.generate_revision(
+                a, "revision a", refresh=True, head="base"
+            )
+            write_script(
+                script,
+                a,
+                """\
+    "Rev A"
+    revision = '%s'
+    down_revision = None
+
+    from alembic import op
+    from sqlalchemy import Column
+    from sqlalchemy import Integer
+    from sqlalchemy import String, Table, MetaData
+
+    some_table = Table(
+        "some_table", MetaData(),
+        Column('id', Integer, primary_key=True),
+        Column('bar', String)
+    )
+
+    renamed_table = Table(
+        "renamed_table", MetaData(),
+        Column('id', Integer, primary_key=True),
+        Column('bar', String),
+        Column('foo', Integer)
+    )
+
+    def upgrade():
+        with op.batch_alter_table("some_table", copy_from=some_table) as batch_op:
+            batch_op.add_column(Column('foo', Integer))
+            batch_op.alter_column('bar', nullable=False)
+            batch_op.rename_table("renamed_table")
+
+    def downgrade():
+        with op.batch_alter_table("renamed_table", copy_from=renamed_table) as batch_op:
+            batch_op.drop_column('foo')
+            batch_op.alter_column('bar', nullable=True)
+            batch_op.rename_table("some_table")
+
+    """ % a,  # noqa: E501
+            )
+
+        yield go
+        clear_staging_env()
+
+    def test_upgrade_rename_w_copy_from(self, rename_batch_fixture):
+        rename_batch_fixture()
+
+        with capture_context_buffer() as buf:
+            command.upgrade(self.cfg, self.a, sql=True)
+
+        self._assert_statement_order(
+            buf.getvalue(),
+            [
+                "CREATE TABLE _alembic_tmp_some_table",
+                "INSERT INTO _alembic_tmp_some_table (id, bar) "
+                "SELECT some_table.id, some_table.bar FROM some_table",
+                "ALTER TABLE some_table RENAME TO renamed_table",
+                "DROP TABLE renamed_table",
+                "ALTER TABLE _alembic_tmp_some_table "
+                "RENAME TO renamed_table",
+            ],
+        )
+
+    def test_downgrade_rename_w_copy_from(self, rename_batch_fixture):
+        rename_batch_fixture()
+
+        with capture_context_buffer() as buf:
+            command.downgrade(self.cfg, f"{self.a}:base", sql=True)
+
+        self._assert_statement_order(
+            buf.getvalue(),
+            [
+                "CREATE TABLE _alembic_tmp_renamed_table",
+                "INSERT INTO _alembic_tmp_renamed_table (id, bar) "
+                "SELECT renamed_table.id, renamed_table.bar "
+                "FROM renamed_table",
+                "ALTER TABLE renamed_table RENAME TO some_table",
+                "DROP TABLE some_table",
+                "ALTER TABLE _alembic_tmp_renamed_table "
+                "RENAME TO some_table",
+            ],
+        )
+
+    def _assert_statement_order(self, sql_text, fragments):
+        sql_text = re.sub(r"\s+", " ", sql_text)
+        pos = -1
+        for fragment in fragments:
+            new_pos = sql_text.find(fragment)
+            assert (
+                new_pos > pos
+            ), f"fragment not found or out of order: {fragment}"
+            pos = new_pos
+
     @testing.fixture
     def no_reflect_batch_fixture(self):
         staging_env()
