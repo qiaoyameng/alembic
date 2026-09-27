@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from alembic.config import Config
     from alembic.operations.ops import MigrationScript
     from alembic.operations.ops import ModifyTableOps
+    from alembic.operations.ops import UpgradeOps
 
 
 MAX_PYTHON_ARGS = 255
@@ -80,19 +81,257 @@ def _render_python_into_templatevars(
 ) -> None:
     imports = autogen_context.imports
 
+    batch_copy_from_states = None
+    reflected = autogen_context._batch_copy_from_reflected
+    if reflected:
+        batch_copy_from_states = [
+            _build_batch_copy_from_state(
+                autogen_context, reflected, upgrade_ops
+            )
+            for upgrade_ops in migration_script.upgrade_ops_list
+        ]
+
     for upgrade_ops, downgrade_ops in zip(
         migration_script.upgrade_ops_list, migration_script.downgrade_ops_list
     ):
-        template_args[upgrade_ops.upgrade_token] = _indent(
-            _render_cmd_body(upgrade_ops, autogen_context)
-        )
-        template_args[downgrade_ops.downgrade_token] = _indent(
-            _render_cmd_body(downgrade_ops, autogen_context)
-        )
+        if batch_copy_from_states is not None:
+            state = batch_copy_from_states.pop(0)
+            autogen_context._batch_copy_from_current = _BatchCopyFromRender(
+                state.upgrade_tables
+            )
+            template_args[upgrade_ops.upgrade_token] = _indent(
+                _render_cmd_body(upgrade_ops, autogen_context)
+            )
+            autogen_context._batch_copy_from_current = _BatchCopyFromRender(
+                state.downgrade_tables
+            )
+            template_args[downgrade_ops.downgrade_token] = _indent(
+                _render_cmd_body(downgrade_ops, autogen_context)
+            )
+            autogen_context._batch_copy_from_current = None
+        else:
+            template_args[upgrade_ops.upgrade_token] = _indent(
+                _render_cmd_body(upgrade_ops, autogen_context)
+            )
+            template_args[downgrade_ops.downgrade_token] = _indent(
+                _render_cmd_body(downgrade_ops, autogen_context)
+            )
     template_args["imports"] = "\n".join(sorted(imports))
 
 
 default_renderers = renderers = util.Dispatcher()
+
+
+class _BatchCopyFromState:
+    """Holds the tables to be embedded as ``copy_from`` for a single
+    upgrade/downgrade ops pair."""
+
+    def __init__(
+        self,
+        upgrade_tables: dict[
+            tuple[str | None, str], tuple[sa_schema.Table, list[Index]]
+        ],
+        downgrade_tables: dict[
+            tuple[str | None, str], tuple[sa_schema.Table, list[Index]]
+        ],
+    ) -> None:
+        self.upgrade_tables = upgrade_tables
+        self.downgrade_tables = downgrade_tables
+
+
+class _BatchCopyFromRender:
+    """Tracks the tables available for, and already emitted within, a
+    single upgrade() or downgrade() body being rendered."""
+
+    def __init__(
+        self,
+        tables: dict[
+            tuple[str | None, str], tuple[sa_schema.Table, list[Index]]
+        ],
+    ) -> None:
+        self.tables = tables
+        self.emitted: dict[str, tuple[str | None, str]] = {}
+
+
+def reflect_batch_copy_from_tables(
+    autogen_context: AutogenContext, migration_script: MigrationScript
+) -> dict[tuple[str | None, str], sa_schema.Table]:
+    """Reflect the current database structure of each table that is
+    subject to a :class:`.ModifyTableOps` directive, so that the
+    structures can be embedded in the generated revision as
+    ``copy_from`` tables.
+
+    This must be called while the database connection is still open.
+
+    """
+    if autogen_context.connection is None:
+        raise util.CommandError(
+            "The render_batch_copy_from option requires an online "
+            "database connection so that current table structures can "
+            "be reflected."
+        )
+
+    impl = autogen_context.migration_context.impl
+    reflected: dict[tuple[str | None, str], sa_schema.Table] = {}
+    for upgrade_ops in migration_script.upgrade_ops_list:
+        for op_ in upgrade_ops.ops:
+            if isinstance(op_, ops.ModifyTableOps):
+                key = (op_.schema, op_.table_name)
+                if key not in reflected:
+                    metadata = sa_schema.MetaData()
+                    reflected[key] = sa_schema.Table(
+                        op_.table_name,
+                        metadata,
+                        schema=op_.schema,
+                        autoload_with=autogen_context.connection,
+                        listeners=[
+                            ("column_reflect", impl.autogen_column_reflect)
+                        ],
+                    )
+    return reflected
+
+
+def _build_batch_copy_from_state(
+    autogen_context: AutogenContext,
+    reflected: dict[tuple[str | None, str], sa_schema.Table],
+    upgrade_ops: UpgradeOps,
+) -> _BatchCopyFromState:
+    upgrade_tables: dict[
+        tuple[str | None, str], tuple[sa_schema.Table, list[Index]]
+    ] = {}
+    downgrade_tables: dict[
+        tuple[str | None, str], tuple[sa_schema.Table, list[Index]]
+    ] = {}
+    for op_ in upgrade_ops.ops:
+        if not isinstance(op_, ops.ModifyTableOps):
+            continue
+        key = (op_.schema, op_.table_name)
+        if key in upgrade_tables or key not in reflected:
+            continue
+        pre_table = reflected[key]
+        upgrade_tables[key] = (pre_table, list(pre_table.indexes))
+        downgrade_tables[key] = _simulate_batch_copy_from(
+            autogen_context, pre_table, op_
+        )
+    return _BatchCopyFromState(upgrade_tables, downgrade_tables)
+
+
+def _simulate_batch_copy_from(
+    autogen_context: AutogenContext,
+    pre_table: sa_schema.Table,
+    modify_table_ops: ModifyTableOps,
+) -> tuple[sa_schema.Table, list[Index]]:
+    """Compute the table structure that results from applying the given
+    upgrade operations to the reflected pre-upgrade table, without
+    touching the database.  The result is used as the ``copy_from``
+    table for the downgrade direction."""
+
+    from ..operations.base import BatchOperations
+    from ..operations.base import Operations
+    from ..operations.batch import ApplyBatchImpl
+    from ..operations.batch import BatchOperationsImpl
+
+    mc = autogen_context.migration_context
+    operations = Operations(mc)
+    batch_impl = BatchOperationsImpl(
+        operations,
+        modify_table_ops.table_name,
+        modify_table_ops.schema,
+        "always",
+        pre_table,
+        (),
+        {},
+        (),
+        {},
+        None,
+        None,
+    )
+    batch_operations = BatchOperations(mc, impl=batch_impl)
+    for sub_op in modify_table_ops.ops:
+        batch_operations.invoke(sub_op)
+
+    apply_impl = ApplyBatchImpl(
+        mc.impl, pre_table, (), {}, False, partial_reordering=()
+    )
+    for opname, arg, kw in batch_impl.batch:
+        fn = getattr(apply_impl, opname)
+        fn(*arg, **kw)
+    apply_impl._transfer_elements_to_new_table()
+    new_table = apply_impl.new_table
+    assert new_table is not None
+    indexes = apply_impl._gather_indexes_from_both_tables()
+    new_table.name = pre_table.name
+    return new_table, indexes
+
+
+def _render_copy_from_assignment(
+    var_name: str,
+    table: sa_schema.Table,
+    indexes: list[Index],
+    autogen_context: AutogenContext,
+) -> str:
+    """Render a ``sa.Table(...)`` constructor call, assigned to the given
+    variable name, for a table to be embedded in a generated revision
+    as a batch ``copy_from`` table."""
+
+    autogen_context._copy_from_strict = True
+    try:
+        sa_prefix = _sqlalchemy_autogenerate_prefix(autogen_context)
+
+        args = []
+        for col in table.columns:
+            rendered = _render_column(col, autogen_context)
+            if rendered:
+                args.append(rendered)
+
+        constraint_args = []
+        for cons in table.constraints:
+            rendered = _render_constraint(
+                cons, autogen_context, table.metadata
+            )
+            if rendered is not None:
+                constraint_args.append(rendered)
+        args.extend(sorted(constraint_args))
+
+        for idx in indexes:
+            args.append(_render_copy_from_index(idx, autogen_context))
+
+        text = "%s = %sTable(\n%r,\n%sMetaData()" % (
+            var_name,
+            sa_prefix,
+            _ident(table.name),
+            sa_prefix,
+        )
+        if args:
+            text += ",\n" + ",\n".join(args)
+        if table.schema:
+            text += ",\nschema=%r" % _ident(table.schema)
+        if table.comment:
+            text += ",\ncomment=%r" % _ident(table.comment)
+        dialect_kwargs = _render_dialect_kwargs_items(
+            autogen_context, table.dialect_kwargs
+        )
+        if dialect_kwargs:
+            text += ",\n" + ",\n".join(dialect_kwargs)
+        text += "\n)"
+        return text
+    finally:
+        autogen_context._copy_from_strict = False
+
+
+def _render_copy_from_index(
+    idx: Index, autogen_context: AutogenContext
+) -> str:
+    sa_prefix = _sqlalchemy_autogenerate_prefix(autogen_context)
+    args = [repr(_render_gen_name(autogen_context, idx.name))]
+    args.extend(_get_index_rendered_expressions(idx, autogen_context))
+    opts = []
+    if idx.unique:
+        opts.append("unique=True")
+    opts.extend(
+        _render_dialect_kwargs_items(autogen_context, idx.dialect_kwargs)
+    )
+    return "%sIndex(%s)" % (sa_prefix, ", ".join(args + opts))
 
 
 def _render_cmd_body(
@@ -146,11 +385,40 @@ def _render_modify_table(
     if op.ops:
         lines = []
         if render_as_batch:
+            copy_from_var = None
+            copy_from_state = autogen_context._batch_copy_from_current
+            if copy_from_state is not None:
+                key = (op.schema, op.table_name)
+                if key in copy_from_state.tables:
+                    table, indexes = copy_from_state.tables[key]
+                    copy_from_var = _batch_copy_from_var_name(
+                        op.table_name, op.schema
+                    )
+                    if copy_from_state.emitted.get(copy_from_var, key) != key:
+                        suffix = 2
+                        base_var = copy_from_var
+                        while copy_from_var in copy_from_state.emitted:
+                            copy_from_var = "%s_%s" % (base_var, suffix)
+                            suffix += 1
+                    if copy_from_var not in copy_from_state.emitted:
+                        lines.append(
+                            _render_copy_from_assignment(
+                                copy_from_var,
+                                table,
+                                indexes,
+                                autogen_context,
+                            )
+                        )
+                        copy_from_state.emitted[copy_from_var] = key
             with autogen_context._within_batch():
-                lines.append(
-                    "with op.batch_alter_table(%r, schema=%r) as batch_op:"
-                    % (op.table_name, op.schema)
+                with_line = "with op.batch_alter_table(%r, schema=%r" % (
+                    op.table_name,
+                    op.schema,
                 )
+                if copy_from_var is not None:
+                    with_line += ", copy_from=%s" % copy_from_var
+                with_line += ") as batch_op:"
+                lines.append(with_line)
                 for t_op in op.ops:
                     t_lines = render_op(autogen_context, t_op)
                     lines.extend(t_lines)
@@ -163,6 +431,14 @@ def _render_modify_table(
         return lines
     else:
         return []
+
+
+def _batch_copy_from_var_name(table_name: str, schema: str | None) -> str:
+    ident = "%s_%s" % (schema, table_name) if schema else str(table_name)
+    ident = re.sub(r"[^0-9a-zA-Z_]", "_", ident)
+    if ident[0].isdigit():
+        ident = "_" + ident
+    return "_alembic_batch_copy_from_%s" % ident
 
 
 @renderers.dispatch_for(ops.CreateTableCommentOp)
@@ -942,6 +1218,17 @@ def _repr_type(
             prefix = _sqlalchemy_autogenerate_prefix(autogen_context)
             return "%s%r" % (prefix, type_)
     else:
+        if (
+            autogen_context._copy_from_strict
+            and autogen_context.opts.get("user_module_prefix") is None
+        ):
+            raise util.CommandError(
+                "Can't embed a batch copy_from table definition: "
+                "column type %r is not a SQLAlchemy built-in type and "
+                "is not covered by a render_item hook or the "
+                "user_module_prefix option, so it cannot be rendered "
+                "into a self-contained revision file." % (type_,)
+            )
         prefix = _user_autogenerate_prefix(autogen_context, type_)
         return "%s%r" % (prefix, type_)
 
@@ -1015,6 +1302,13 @@ def _render_constraint(
     try:
         renderer = _constraint_renderers.dispatch(constraint)
     except ValueError:
+        if autogen_context._copy_from_strict:
+            raise util.CommandError(
+                "Can't embed a batch copy_from table definition: "
+                "no renderer is established for object %r, so it cannot "
+                "be rendered into a self-contained revision file."
+                % (constraint,)
+            ) from None
         util.warn("No renderer is established for object %r" % constraint)
         return "[Unknown Python object %r]" % constraint
     else:

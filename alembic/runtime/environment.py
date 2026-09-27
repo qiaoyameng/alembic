@@ -422,6 +422,7 @@ class EnvironmentContext(util.ModuleClsProxy):
         tag: str | None = None,
         template_args: dict[str, Any] | None = None,
         render_as_batch: bool = False,
+        render_batch_copy_from: bool = False,
         target_metadata: MetaData | Sequence[MetaData] | None = None,
         include_name: IncludeNameFn | None = None,
         include_object: IncludeObjectFn | None = None,
@@ -734,6 +735,43 @@ class EnvironmentContext(util.ModuleClsProxy):
 
             :ref:`batch_migrations`
 
+        :param render_batch_copy_from: if True, then when autogenerate
+         renders ``batch_alter_table()`` directives (see
+         :paramref:`.EnvironmentContext.configure.render_as_batch`), the
+         current structure of each table that is subject to a batch
+         "move and copy" is reflected from the database and embedded
+         directly into the generated revision file as a
+         :class:`~sqlalchemy.schema.Table` definition, which is then passed
+         as the :paramref:`.Operations.batch_alter_table.copy_from`
+         parameter.  This allows the generated revision to produce complete
+         SQL in ``--sql`` (offline) mode for both ``upgrade()`` and
+         ``downgrade()`` without requiring a connection to the original
+         database, which would otherwise not be possible since batch mode
+         normally reflects the table at migration time.
+
+         For the ``downgrade()`` direction, the table structure that is
+         expected to be present *after* the upgrade has run is computed
+         locally from the reflected structure and the generated upgrade
+         operations, and is embedded as well.
+
+         The option requires that autogenerate is run against a live
+         database connection, and is only available when
+         :paramref:`.EnvironmentContext.configure.render_as_batch` is also
+         enabled.  If any column datatype or constraint within a reflected
+         table cannot be rendered into the revision file in a self-contained
+         way (for example a user-defined type that is not covered by the
+         :paramref:`.EnvironmentContext.configure.render_item` hook or
+         :paramref:`.EnvironmentContext.configure.user_module_prefix`),
+         a :class:`~alembic.util.CommandError` is raised rather than
+         emitting an incomplete definition.
+
+         Defaults to False, leaving the standard online batch behavior
+         unchanged.
+
+         .. seealso::
+
+            :ref:`batch_migrations`
+
         :param include_schemas: If True, autogenerate will scan across
          all schemas located by the SQLAlchemy
          :meth:`~sqlalchemy.engine.reflection.Inspector.get_schema_names`
@@ -915,6 +953,11 @@ class EnvironmentContext(util.ModuleClsProxy):
         opts["include_object"] = include_object
         opts["include_schemas"] = include_schemas
         opts["render_as_batch"] = render_as_batch
+        if render_batch_copy_from and not render_as_batch:
+            raise util.CommandError(
+                "render_batch_copy_from requires render_as_batch=True"
+            )
+        opts["render_batch_copy_from"] = render_batch_copy_from
         opts["upgrade_token"] = upgrade_token
         opts["downgrade_token"] = downgrade_token
         opts["sqlalchemy_module_prefix"] = sqlalchemy_module_prefix

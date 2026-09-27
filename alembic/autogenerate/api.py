@@ -399,6 +399,11 @@ class AutogenContext:
         self.imports = set()
         self.opts: dict[str, Any] = opts
         self._has_batch: bool = False
+        self._copy_from_strict: bool = False
+        self._batch_copy_from_reflected: (
+            dict[tuple[str | None, str], Table] | None
+        ) = None
+        self._batch_copy_from_current: Any = None
 
     @util.memoized_property
     def inspector(self) -> Inspector:
@@ -540,6 +545,7 @@ class RevisionContext:
         self.script_directory = script_directory
         self.command_args = command_args
         self.process_revision_directives = process_revision_directives
+        self._batch_copy_from_tables: dict[tuple[str | None, str], Table] = {}
         self.template_args = {
             "config": config  # Let templates use config for
             # e.g. multiple databases
@@ -551,6 +557,11 @@ class RevisionContext:
 
         if getattr(migration_script, "_needs_render", False):
             autogen_context = self._last_autogen_context
+
+            if self._batch_copy_from_tables:
+                autogen_context._batch_copy_from_reflected = (
+                    self._batch_copy_from_tables
+                )
 
             # clear out existing imports if we are doing multiple
             # renders
@@ -627,6 +638,12 @@ class RevisionContext:
             compare._populate_migration_script(
                 autogen_context, migration_script
             )
+            if autogen_context.opts.get("render_batch_copy_from"):
+                self._batch_copy_from_tables.update(
+                    render.reflect_batch_copy_from_tables(
+                        autogen_context, migration_script
+                    )
+                )
 
         if self.process_revision_directives:
             self.process_revision_directives(
