@@ -399,6 +399,64 @@ class AutogenContext:
         self.imports = set()
         self.opts: dict[str, Any] = opts
         self._has_batch: bool = False
+        self._effective_column_renames: dict[
+            tuple[str | None, str], dict[str, str]
+        ] = {}
+
+    @util.memoized_property
+    def column_renames(self) -> dict[tuple[str | None, str], dict[str, str]]:
+        """Return the normalized ``column_renames`` autogenerate option.
+
+        The returned dictionary maps ``(schema, table_name)`` tuples to
+        a dictionary of ``old_column_name -> new_column_name`` hints.
+        Keys that name the default schema are normalized to use
+        ``None`` as the schema, matching how reflected table names are
+        organized.
+
+        """
+        renames = self.opts.get("column_renames") or {}
+        default_schema = self.dialect.default_schema_name
+        normalized: dict[tuple[str | None, str], dict[str, str]] = {}
+        for key, mapping in renames.items():
+            if (
+                not isinstance(key, tuple)
+                or len(key) != 2
+                or not isinstance(key[1], str)
+                or (key[0] is not None and not isinstance(key[0], str))
+            ):
+                raise util.CommandError(
+                    "column_renames keys must be (schema, table_name) "
+                    "tuples; got %r" % (key,)
+                )
+            schema, tname = key
+            if not isinstance(mapping, dict) or not all(
+                isinstance(old, str) and isinstance(new, str)
+                for old, new in mapping.items()
+            ):
+                raise util.CommandError(
+                    "column_renames values must be dictionaries of "
+                    "old column name to new column name; got %r" % (mapping,)
+                )
+            if schema == default_schema:
+                schema = None
+            normalized.setdefault((schema, tname), {}).update(mapping)
+        return normalized
+
+    def column_renames_for(
+        self, schema: str | None, tname: str
+    ) -> dict[str, str]:
+        """Return the column rename hints in effect for a table.
+
+        If the table has been processed by the column comparison,
+        the effective (post-filter) renames are returned; otherwise
+        the configured hints are returned as a best-effort fallback,
+        used e.g. for the referred side of foreign keys.
+
+        """
+        key = (schema, tname)
+        if key in self._effective_column_renames:
+            return self._effective_column_renames[key]
+        return self.column_renames.get(key, {})
 
     @util.memoized_property
     def inspector(self) -> Inspector:

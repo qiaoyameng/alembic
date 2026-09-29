@@ -426,6 +426,9 @@ class EnvironmentContext(util.ModuleClsProxy):
         include_name: IncludeNameFn | None = None,
         include_object: IncludeObjectFn | None = None,
         include_schemas: bool = False,
+        column_renames: (
+            dict[tuple[str | None, str], dict[str, str]] | None
+        ) = None,
         process_revision_directives: None | (
             ProcessRevisionDirectiveFn
         ) = None,
@@ -751,6 +754,45 @@ class EnvironmentContext(util.ModuleClsProxy):
 
             :paramref:`.EnvironmentContext.configure.include_object`
 
+        :param column_renames: A dictionary of explicit column rename
+         hints to be used during autogenerate, allowing a renamed column
+         to be detected as an ``ALTER COLUMN ... RENAME TO`` operation
+         rather than a ``DROP`` of the old column paired with an ``ADD``
+         of the new one.   The dictionary is keyed by
+         ``(schema_name, table_name)`` tuples, where ``schema_name`` may
+         be ``None`` for the default schema, and each value is a
+         dictionary mapping the existing column name in the database to
+         the new column name in the target metadata::
+
+            context.configure(
+                # ...
+                column_renames={
+                    (None, "my_table"): {"old_col": "new_col"},
+                }
+            )
+
+         Renames are only detected for columns explicitly named here;
+         no similarity-based guessing is performed.   Each hint is
+         validated against the reflected database structure and the
+         target metadata before any operations are generated:  the old
+         column must exist in the database, the new column must exist in
+         the target metadata, and hints that are ambiguous or
+         contradictory (multiple columns renamed to the same name,
+         renames that would overwrite an existing column, rename cycles)
+         are rejected with an error.   Objects that are excluded by the
+         :paramref:`.EnvironmentContext.configure.include_name` or
+         :paramref:`.EnvironmentContext.configure.include_object` hooks
+         are not affected by rename hints.
+
+         Once a rename is established, the column continues to be
+         compared for other changes including type, server default,
+         nullable, and surrounding indexes and constraints, and the
+         rendered operation is reversible for downgrade.
+
+         .. seealso::
+
+            :ref:`autogen_column_renames`
+
         :param render_item: Callable that can be used to override how
          any schema item, i.e. column, constraint, type,
          etc., is rendered for autogenerate.  The callable receives a
@@ -914,6 +956,7 @@ class EnvironmentContext(util.ModuleClsProxy):
         opts["include_name"] = include_name
         opts["include_object"] = include_object
         opts["include_schemas"] = include_schemas
+        opts["column_renames"] = column_renames
         opts["render_as_batch"] = render_as_batch
         opts["upgrade_token"] = upgrade_token
         opts["downgrade_token"] = downgrade_token

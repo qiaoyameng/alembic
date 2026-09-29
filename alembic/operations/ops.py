@@ -1714,6 +1714,17 @@ class AlterColumnOp(AlterTableOp):
         col_diff = []
         schema, tname, cname = self.schema, self.table_name, self.column_name
 
+        if self.modify_name is not None:
+            col_diff.append(
+                (
+                    "rename_column",
+                    schema,
+                    tname,
+                    cname,
+                    self.modify_name,
+                )
+            )
+
         if self.modify_type is not None:
             col_diff.append(
                 (
@@ -1796,6 +1807,7 @@ class AlterColumnOp(AlterTableOp):
             or self.modify_server_default is not False
             or self.modify_type is not None
             or self.modify_comment is not False
+            or self.modify_name is not None
         )
         if hc1:
             return True
@@ -1833,8 +1845,13 @@ class AlterColumnOp(AlterTableOp):
                 kw["existing_%s" % k] = kw["modify_%s" % k]
                 kw["modify_%s" % k] = swap
 
+        column_name = self.column_name
+        if self.modify_name is not None:
+            kw["modify_name"] = self.column_name
+            column_name = self.modify_name
+
         return self.__class__(
-            self.table_name, self.column_name, schema=self.schema, **kw
+            self.table_name, column_name, schema=self.schema, **kw
         )
 
     @classmethod

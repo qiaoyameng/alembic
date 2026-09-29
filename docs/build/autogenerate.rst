@@ -513,6 +513,63 @@ dictionary::
     )
 
 
+.. _autogen_column_renames:
+
+Detecting Column Renames
+-------------------------
+
+When a column is renamed in the target metadata, autogenerate by default
+produces a :meth:`.Operations.drop_column` for the old column paired with
+an :meth:`.Operations.add_column` for the new one, which would lose the
+data held in the column.   Autogenerate does not attempt to guess renames
+based on column similarity; instead, explicit rename hints may be passed
+using the :paramref:`.EnvironmentContext.configure.column_renames`
+parameter::
+
+    context.configure(
+        # ...
+        column_renames={
+            (None, "my_table"): {"old_col": "new_col"},
+            ("my_schema", "other_table"): {"a": "b"},
+        }
+    )
+
+The dictionary is keyed by ``(schema_name, table_name)`` tuples, where
+``schema_name`` is ``None`` for the default schema, and each value maps
+the existing column name in the database to the new column name in the
+target metadata.   Only columns explicitly named here are considered
+renamed.
+
+Each hint is validated against the reflected database structure and the
+target metadata before any operations are generated; if any hint is
+invalid, the revision is aborted with an error and no hints are applied.
+A hint is invalid if:
+
+* the table or the old column does not exist in the database
+* the table or the new column does not exist in the target metadata
+* the old column is still present in the target metadata, or the new
+  column already exists in the database (i.e. the rename would overwrite
+  a column that is being kept)
+* multiple columns in the same table are renamed to the same target name
+* the hints form a rename cycle (e.g. ``a -> b`` and ``b -> a``), which
+  is not supported
+
+Columns or tables that are excluded by the
+:paramref:`.EnvironmentContext.configure.include_name` or
+:paramref:`.EnvironmentContext.configure.include_object` hooks are not
+pulled back into the comparison by a rename hint; the hint is simply
+ignored for those objects.
+
+Once a rename is established, the column continues to be compared for
+all other changes, including datatype, server default, and nullability,
+and indexes and constraints that refer to the column are matched across
+the rename rather than being dropped and re-added.   The generated
+:meth:`.Operations.alter_column` operation includes the
+:paramref:`.Operations.alter_column.new_column_name` parameter, is
+reversible for downgrade, and is also rendered within
+:ref:`batch mode <batch_migrations>` when ``render_as_batch`` is
+enabled.
+
 
 Comparing and Rendering Types
 ------------------------------

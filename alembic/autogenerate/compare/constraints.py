@@ -48,6 +48,25 @@ _C = TypeVar("_C", bound=Union[UniqueConstraint, ForeignKeyConstraint, Index])
 log = logging.getLogger(__name__)
 
 
+def _translate_column_renames(
+    params: Any, renames: dict[str, str], key: str = "column_names"
+) -> Any:
+    """Return a copy of a reflected constraint/index dictionary with
+    column names translated through the effective rename map, so that
+    renamed columns are compared as the same column."""
+    params = dict(params)
+    params[key] = [
+        renames.get(cname, cname) if cname is not None else None
+        for cname in params[key]
+    ]
+    if params.get("column_sorting"):
+        params["column_sorting"] = {
+            renames.get(cname, cname): sorting
+            for cname, sorting in params["column_sorting"].items()
+        }
+    return params
+
+
 def _compare_indexes_and_uniques(
     autogen_context: AutogenContext,
     modify_ops: ModifyTableOps,
@@ -82,6 +101,9 @@ def _compare_indexes_and_uniques(
     unique_constraints_duplicate_unique_indexes = False
 
     if conn_table is not None:
+        column_renames = autogen_context._effective_column_renames.get(
+            (schema, tname)
+        )
         conn_uniques_reflected: Collection[ReflectedUniqueConstraint] = (
             frozenset()
         )
@@ -114,6 +136,11 @@ def _compare_indexes_and_uniques(
             for uq in conn_uniques_reflected:
                 if uq.get("duplicates_index"):
                     unique_constraints_duplicate_unique_indexes = True
+        if column_renames:
+            conn_uniques_reflected = [
+                _translate_column_renames(uq, column_renames)
+                for uq in conn_uniques_reflected
+            ]
         try:
             conn_indexes_reflected = _InspectorConv(inspector).get_indexes(
                 tname, schema=schema
@@ -129,6 +156,11 @@ def _compare_indexes_and_uniques(
                     "index",
                     {"table_name": tname, "schema_name": schema},
                 )
+            ]
+        if column_renames:
+            conn_indexes_reflected = [
+                _translate_column_renames(ix, column_renames)
+                for ix in conn_indexes_reflected
             ]
 
         # 2. convert conn-level objects from raw inspector records
@@ -656,6 +688,30 @@ def _compare_foreign_keys(
             {"table_name": tname, "schema_name": schema},
         )
     ]
+
+    if autogen_context.column_renames:
+        local_renames = autogen_context._effective_column_renames.get(
+            (schema, tname), {}
+        )
+        translated_fks = []
+        for fk in conn_fks_list:
+            referred_renames = autogen_context.column_renames_for(
+                fk["referred_schema"], fk["referred_table"]
+            )
+            if local_renames or referred_renames:
+                fk = dict(fk)
+                if local_renames:
+                    fk["constrained_columns"] = [
+                        local_renames.get(cname, cname)
+                        for cname in fk["constrained_columns"]
+                    ]
+                if referred_renames:
+                    fk["referred_columns"] = [
+                        referred_renames.get(cname, cname)
+                        for cname in fk["referred_columns"]
+                    ]
+            translated_fks.append(fk)
+        conn_fks_list = translated_fks
 
     conn_fks = {
         _make_foreign_key(const, conn_table) for const in conn_fks_list
